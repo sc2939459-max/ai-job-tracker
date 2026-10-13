@@ -13,7 +13,7 @@ from sqlalchemy.orm import Session
 
 from ..database import get_db
 from ..deps import get_current_user
-from ..models import GoogleMailbox
+from ..models import GoogleMailbox, JobApplication, RecruiterMessage
 
 router = APIRouter(prefix="/recruiter-messages", tags=["Recruiter Messages"])
 
@@ -72,6 +72,58 @@ def _plain_text(value: str) -> str:
     value = re.sub(r"</p\s*>", "\n", value, flags=re.I)
     value = re.sub(r"<[^>]+>", " ", value)
     return html.unescape(value).strip()
+
+
+def _normalize_match_value(value: str | None) -> str:
+    if not value:
+        return ""
+    return re.sub(r"[^a-z0-9]+", " ", value.lower()).strip()
+
+
+def _message_matches_tracked_application(item: dict, applications: list[JobApplication]) -> bool:
+    if not applications:
+        return False
+
+    message_company = _normalize_match_value(item.get("company"))
+    message_role = _normalize_match_value(item.get("role"))
+    sender = _normalize_match_value(item.get("sender"))
+    subject = _normalize_match_value(item.get("subject"))
+    body = _normalize_match_value(item.get("message"))
+
+    for app in applications:
+        app_company = _normalize_match_value(app.company)
+        app_role = _normalize_match_value(app.role)
+        if not app_company:
+            continue
+
+        company_match = (
+            app_company == message_company
+            or app_company in message_company
+            or message_company in app_company
+            or (message_company and sender and app_company in sender)
+        )
+
+        if not company_match:
+            continue
+
+        if not message_role and not app_role:
+            return True
+
+        if not app_role or not message_role:
+            return True
+
+        role_match = (
+            app_role == message_role
+            or app_role in message_role
+            or message_role in app_role
+            or app_role in subject
+            or app_role in body
+            or message_role in (app_role or "")
+        )
+        if role_match:
+            return True
+
+    return False
 
 
 def _extract_text(payload: dict) -> str:
@@ -146,7 +198,7 @@ def _refresh_access_token(mailbox: GoogleMailbox) -> str:
     return response.json()["access_token"]
 
 
-def _fetch_messages(mailbox: GoogleMailbox) -> list[dict]:
+def _fetch_messages(mailbox: GoogleMailbox, tracked_applications: list[JobApplication] | None = None) -> list[dict]:
     access_token = _refresh_access_token(mailbox)
     headers = {"Authorization": f"Bearer {access_token}"}
     params = {
@@ -163,8 +215,11 @@ def _fetch_messages(mailbox: GoogleMailbox) -> list[dict]:
         if detail.status_code >= 400:
             continue
         item = _parse_message(detail.json())
-        if _is_recruiter_message(item["subject"], item["sender"], item["message"]):
-            messages.append(item)
+        if not _is_recruiter_message(item["subject"], item["sender"], item["message"]):
+            continue
+        if tracked_applications is not None and not _message_matches_tracked_application(item, tracked_applications):
+            continue
+        messages.append(item)
     messages.sort(key=lambda x: x.get("receivedAt") or "", reverse=True)
     return messages
 
@@ -239,7 +294,12 @@ def list_messages(db: Session = Depends(get_db), user=Depends(get_current_user))
     mailbox = db.query(GoogleMailbox).filter(GoogleMailbox.user_id == user.id).first()
     if not mailbox:
         return []
-    return _fetch_messages(mailbox)
+    tracked_applications = (
+        db.query(JobApplication)
+        .filter(JobApplication.user_id == user.id)
+        .all()
+    )
+    return _fetch_messages(mailbox, tracked_applications)
 
 
 @router.post("/sync")
@@ -247,4 +307,74 @@ def sync_messages(db: Session = Depends(get_db), user=Depends(get_current_user))
     mailbox = db.query(GoogleMailbox).filter(GoogleMailbox.user_id == user.id).first()
     if not mailbox:
         raise HTTPException(409, "Gmail is not connected. Connect Gmail first.")
-    return _fetch_messages(mailbox)
+    tracked_applications = (
+        db.query(JobApplication)
+        .filter(JobApplication.user_id == user.id)
+        .all()
+    )
+    return _fetch_messages(mailbox, tracked_applications)
+
+
+@router.get("/portal")
+def list_portal_messages(db: Session = Depends(get_db), user=Depends(get_current_user)):
+    return (
+        db.query(RecruiterMessage)
+        .filter(RecruiterMessage.user_id == user.id)
+        .order_by(RecruiterMessage.received_at.desc(), RecruiterMessage.created_at.desc())
+        .all()
+    )
+
+
+@router.post("/portal")
+def create_portal_message(
+    company: str,
+    role: str | None = None,
+    sender_name: str | None = None,
+    sender_email: str | None = None,
+    subject: str = "Recruiter update",
+    body: str = "",
+    category: str = "General Recruiter Message",
+    application_status: str | None = None,
+    source: str = "portal",
+    job_id: int | None = None,
+    external_url: str | None = None,
+    db: Session = Depends(get_db),
+    user=Depends(get_current_user),
+):
+    message = RecruiterMessage(
+        user_id=user.id,
+        job_id=job_id,
+        company=company,
+        role=role,
+        sender_name=sender_name,
+        sender_email=sender_email,
+        subject=subject,
+        body=body,
+        category=category,
+        application_status=application_status,
+        source=source,
+        external_url=external_url,
+        received_at=datetime.now(timezone.utc),
+    )
+    db.add(message)
+    db.commit()
+    db.refresh(message)
+    return message
+
+
+@router.post("/portal/{message_id}/read")
+def mark_portal_message_read(
+    message_id: int,
+    db: Session = Depends(get_db),
+    user=Depends(get_current_user),
+):
+    message = (
+        db.query(RecruiterMessage)
+        .filter(RecruiterMessage.id == message_id, RecruiterMessage.user_id == user.id)
+        .first()
+    )
+    if not message:
+        raise HTTPException(404, "Message not found")
+    message.is_read = True
+    db.commit()
+    return {"message": "Recruiter message marked as read"}

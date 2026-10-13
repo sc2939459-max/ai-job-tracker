@@ -8366,6 +8366,43 @@ textarea:focus-visible {
   border-right: 1px solid #e9eef5;
 }
 
+.recruiter-message-summary > :nth-child(n+5) {
+  border-top: 1px solid #e9eef5;
+}
+
+.recruiter-summary-stat {
+  background: #fbfcfe;
+}
+
+.recruiter-message-summary > button.recruiter-summary-stat {
+  background: #fbfcfe;
+}
+
+.recruiter-message-summary > button.recruiter-summary-stat:hover,
+.recruiter-message-summary > button.recruiter-summary-stat.active {
+  background: #f5f9ff;
+}
+
+.recruiter-application-results {
+  padding: 18px 22px 22px;
+  background: #f8fafc;
+}
+
+.recruiter-application-results-heading {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 12px;
+  color: #263957;
+  font-size: 12px;
+}
+
+.recruiter-application-results-heading span {
+  color: #7a899e;
+  font-size: 10px;
+}
+
 .recruiter-message-summary > button {
   width:100%;
   border-top:0;
@@ -9125,11 +9162,14 @@ textarea:focus-visible {
   .recruiter-message-summary {
     grid-template-columns: 1fr 1fr;
   }
-  .recruiter-message-summary > :nth-child(2) {
+  .recruiter-message-summary > :nth-child(even) {
     border-right: 0;
   }
+  .recruiter-message-summary > :nth-child(n+3) {
+    border-top: 1px solid #e9eef5;
+  }
   .recruiter-message-summary > :nth-child(-n+2) {
-    border-bottom: 1px solid #e9eef5;
+    border-bottom: 0;
   }
   .recruiter-message-card {
     grid-template-columns: 36px minmax(0,1fr);

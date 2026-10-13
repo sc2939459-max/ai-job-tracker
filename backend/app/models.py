@@ -66,6 +66,18 @@ class User(Base):
         cascade="all, delete-orphan",
     )
 
+    recruiter_messages = relationship(
+        "RecruiterMessage",
+        back_populates="user",
+        cascade="all, delete-orphan",
+    )
+
+    notifications = relationship(
+        "Notification",
+        back_populates="user",
+        cascade="all, delete-orphan",
+    )
+
 
 # ============================================================
 # COMPANY / ATS INTEGRATION
@@ -271,6 +283,18 @@ class JobApplication(Base):
     resume_version = relationship(
         "ResumeVersion",
         foreign_keys=[resume_version_id],
+    )
+
+    recruiter_messages = relationship(
+        "RecruiterMessage",
+        back_populates="job",
+        cascade="all, delete-orphan",
+    )
+
+    notifications = relationship(
+        "Notification",
+        back_populates="job",
+        cascade="all, delete-orphan",
     )
 
 
@@ -622,4 +646,220 @@ class MatchAnalysis(Base):
 
     job_description = relationship(
         "JobDescription",
+    )
+
+
+# ============================================================
+# RECRUITER MESSAGES
+# ============================================================
+
+class RecruiterMessage(Base):
+    __tablename__ = "recruiter_messages"
+
+    id: Mapped[int] = mapped_column(
+        Integer,
+        primary_key=True,
+    )
+
+    user_id: Mapped[int] = mapped_column(
+        ForeignKey(
+            "users.id",
+            ondelete="CASCADE",
+        ),
+        index=True,
+    )
+
+    job_id: Mapped[int | None] = mapped_column(
+        ForeignKey(
+            "job_applications.id",
+            ondelete="SET NULL",
+        ),
+        nullable=True,
+        index=True,
+    )
+
+    company: Mapped[str | None] = mapped_column(
+        String(150),
+        nullable=True,
+        index=True,
+    )
+
+    role: Mapped[str | None] = mapped_column(
+        String(150),
+        nullable=True,
+    )
+
+    sender_name: Mapped[str | None] = mapped_column(
+        String(150),
+        nullable=True,
+    )
+
+    sender_email: Mapped[str | None] = mapped_column(
+        String(255),
+        nullable=True,
+    )
+
+    subject: Mapped[str] = mapped_column(
+        String(250),
+        default="Recruiter update",
+    )
+
+    body: Mapped[str] = mapped_column(
+        Text,
+        default="",
+    )
+
+    category: Mapped[str] = mapped_column(
+        String(80),
+        default="General Recruiter Message",
+    )
+
+    application_status: Mapped[str | None] = mapped_column(
+        String(80),
+        nullable=True,
+    )
+
+    source: Mapped[str] = mapped_column(
+        String(40),
+        default="portal",
+    )
+
+    external_url: Mapped[str | None] = mapped_column(
+        String(500),
+        nullable=True,
+    )
+
+    received_at: Mapped[datetime | None] = mapped_column(
+        DateTime,
+        nullable=True,
+    )
+
+    is_read: Mapped[bool] = mapped_column(
+        default=False,
+    )
+
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime,
+        default=datetime.utcnow,
+    )
+
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime,
+        default=datetime.utcnow,
+        onupdate=datetime.utcnow,
+    )
+
+    user = relationship(
+        "User",
+        back_populates="recruiter_messages",
+    )
+
+    job = relationship(
+        "JobApplication",
+        back_populates="recruiter_messages",
+    )
+
+    notifications = relationship(
+        "Notification",
+        back_populates="message",
+        cascade="all, delete-orphan",
+    )
+
+
+# ============================================================
+# NOTIFICATIONS
+# ============================================================
+
+class Notification(Base):
+    __tablename__ = "notifications"
+
+    id: Mapped[int] = mapped_column(
+        Integer,
+        primary_key=True,
+    )
+
+    user_id: Mapped[int] = mapped_column(
+        ForeignKey(
+            "users.id",
+            ondelete="CASCADE",
+        ),
+        index=True,
+    )
+
+    job_id: Mapped[int | None] = mapped_column(
+        ForeignKey(
+            "job_applications.id",
+            ondelete="SET NULL",
+        ),
+        nullable=True,
+        index=True,
+    )
+
+    message_id: Mapped[int | None] = mapped_column(
+        ForeignKey(
+            "recruiter_messages.id",
+            ondelete="SET NULL",
+        ),
+        nullable=True,
+        index=True,
+    )
+
+    title: Mapped[str] = mapped_column(
+        String(200),
+    )
+
+    description: Mapped[str] = mapped_column(
+        Text,
+        default="",
+    )
+
+    notification_type: Mapped[str] = mapped_column(
+        String(80),
+        default="status_update",
+    )
+
+    company: Mapped[str | None] = mapped_column(
+        String(150),
+        nullable=True,
+    )
+
+    link: Mapped[str | None] = mapped_column(
+        String(255),
+        nullable=True,
+    )
+
+    is_read: Mapped[bool] = mapped_column(
+        default=False,
+    )
+
+    details: Mapped[dict | None] = mapped_column(
+        "metadata",
+        JSON,
+        nullable=True,
+    )
+
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime,
+        default=datetime.utcnow,
+    )
+
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime,
+        default=datetime.utcnow,
+        onupdate=datetime.utcnow,
+    )
+
+    user = relationship(
+        "User",
+        back_populates="notifications",
+    )
+
+    job = relationship(
+        "JobApplication",
+        back_populates="notifications",
+    )
+
+    message = relationship(
+        "RecruiterMessage",
+        back_populates="notifications",
     )
