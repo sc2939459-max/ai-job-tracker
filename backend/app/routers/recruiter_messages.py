@@ -8,6 +8,7 @@ import re
 from datetime import datetime, timedelta, timezone
 from email.utils import parseaddr, parsedate_to_datetime
 from typing import Any
+from urllib import response
 from urllib.parse import urlencode
 
 import httpx
@@ -445,45 +446,116 @@ def _refresh_access_token(mailbox: GoogleMailbox) -> str:
     return access_token
 
 
-def _gmail_get(url: str, headers: dict[str, str], params: dict[str, Any] | None = None):
+def _gmail_get(
+    url: str,
+    headers: dict[str, str],
+    params: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Make a Gmail API request and handle provider errors safely."""
     try:
-        response = httpx.get(url, headers=headers, params=params, timeout=20)
+        response = httpx.get(
+            url,
+            headers=headers,
+            params=params,
+            timeout=20,
+        )
+    except httpx.TimeoutException:
+        logger.warning("Gmail API request timed out.")
+        raise HTTPException(
+            status_code=504,
+            detail="Gmail took too long to respond. Please try again.",
+        )
     except httpx.RequestError:
+        logger.exception("Could not connect to Gmail API.")
         raise HTTPException(
             status_code=502,
-            detail="Could not connect to Gmail. Try again later.",
+            detail="Could not connect to Gmail. Please try again later.",
         )
+
     if response.status_code == 401:
+        logger.warning("Gmail API rejected the access token.")
         raise HTTPException(
             status_code=502,
-            detail="Google authorization expired or was revoked. Reconnect Gmail.",
+            detail="Google authorization expired. Reconnect Gmail.",
         )
-    if response.status_code == 429:
+
+    if response.status_code == 403:
+        reasons: list[str] = []
+        try:
+            payload = response.json()
+            error = payload.get("error", {})
+            if isinstance(error, dict):
+                reasons = [
+                    str(item["reason"])
+                    for item in error.get("errors", [])
+                    if isinstance(item, dict) and item.get("reason")
+                ]
+                if not reasons and error.get("status"):
+                    reasons = [str(error["status"])]
+        except (ValueError, AttributeError, TypeError):
+            pass
+
+        endpoint = (
+            "message detail" if "/messages/" in url else "message list"
+        )
+        logger.warning(
+            "Gmail API returned 403 for %s; reasons=%s",
+            endpoint,
+            reasons or ["not provided"],
+        )
         raise HTTPException(
-            status_code=503,
-            detail="Gmail rate limit reached. Try syncing again later.",
+            status_code=403,
+            detail="Gmail denied access to this request.",
         )
+
     if response.status_code == 404:
         raise HTTPException(
             status_code=404,
             detail="Gmail message was not found.",
         )
-    if response.status_code == 403:
-        logger.warning("Gmail denied access to an individual message.")
+
+    if response.status_code == 429:
+        logger.warning("Gmail API rate limit reached.")
         raise HTTPException(
-            status_code=403,
-            detail="Gmail denied access to this message.",
+            status_code=503,
+            detail="Gmail rate limit reached. Try again later.",
         )
-    if response.status_code >= 400:
-        # Do not expose Google's raw response, which can contain account/provider details.
+
+    if response.status_code >= 500:
+        logger.warning(
+            "Gmail API returned HTTP %s.",
+            response.status_code,
+        )
         raise HTTPException(
             status_code=502,
-            detail="Gmail could not return messages. Try again later.",
+            detail="Gmail is temporarily unavailable. Please try again.",
         )
+
+    if response.status_code >= 400:
+        logger.warning(
+            "Gmail API returned HTTP %s.",
+            response.status_code,
+        )
+        raise HTTPException(
+            status_code=502,
+            detail="Gmail could not return messages. Check Gmail permissions.",
+        )
+
     try:
-        return response.json()
+        data = response.json()
     except ValueError:
-        raise HTTPException(status_code=502, detail="Gmail returned an invalid response.")
+        raise HTTPException(
+            status_code=502,
+            detail="Gmail returned an invalid response.",
+        )
+
+    if not isinstance(data, dict):
+        raise HTTPException(
+            status_code=502,
+            detail="Gmail returned an unexpected response.",
+        )
+
+    return data
 
 
 def _fetch_messages(mailbox: GoogleMailbox) -> list[dict[str, Any]]:
@@ -523,11 +595,13 @@ def _fetch_messages(mailbox: GoogleMailbox) -> list[dict[str, Any]]:
                 if exc.status_code == 404:
                     logger.info("Skipping Gmail message that no longer exists")
                     continue
+
                 if exc.status_code == 403:
                     logger.warning(
-                        "Skipping an individual Gmail message because access was denied."
+                        "Skipping a Gmail message because Google denied access."
                     )
                     continue
+
                 raise
 
             item = _parse_message(detail)
