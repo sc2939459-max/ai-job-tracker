@@ -464,7 +464,16 @@ def _gmail_get(url: str, headers: dict[str, str], params: dict[str, Any] | None 
             detail="Gmail rate limit reached. Try syncing again later.",
         )
     if response.status_code == 404:
-        raise HTTPException(status_code=404, detail="Gmail message was not found.")
+        raise HTTPException(
+            status_code=404,
+            detail="Gmail message was not found.",
+        )
+    if response.status_code == 403:
+        logger.warning("Gmail denied access to an individual message.")
+        raise HTTPException(
+            status_code=403,
+            detail="Gmail denied access to this message.",
+        )
     if response.status_code >= 400:
         # Do not expose Google's raw response, which can contain account/provider details.
         raise HTTPException(
@@ -511,10 +520,13 @@ def _fetch_messages(mailbox: GoogleMailbox) -> list[dict[str, Any]]:
                     {"format": "full"},
                 )
             except HTTPException as exc:
-                # A message can disappear between list and detail calls. Skip only that
-                # message; propagate authentication, rate-limit, and service failures.
                 if exc.status_code == 404:
                     logger.info("Skipping Gmail message that no longer exists")
+                    continue
+                if exc.status_code == 403:
+                    logger.warning(
+                        "Skipping an individual Gmail message because access was denied."
+                    )
                     continue
                 raise
 
