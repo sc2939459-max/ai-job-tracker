@@ -7,7 +7,7 @@ from sqlalchemy.orm import Session
 
 from ..database import get_db
 from ..deps import get_current_user
-from ..models import JobApplication
+from ..models import JobApplication, Notification
 from ..schemas import JobCreate, JobOut
 
 router = APIRouter(
@@ -19,12 +19,92 @@ STATUSES = [
     "Wishlist",
     "Applying",
     "Applied",
+    "Application Received",
+    "Under Review",
+    "Shortlisted",
+    "Interview Scheduled",
+    "Assessment",
+    "Selected",
+    "Offer Received",
     "Screening",
     "Interview",
     "Offer",
     "Rejected",
     "Withdrawn",
 ]
+
+STATUS_ALIASES = {
+    "application received": "Application Received",
+    "under review": "Under Review",
+    "shortlisted": "Shortlisted",
+    "interview scheduled": "Interview Scheduled",
+    "assessment": "Assessment",
+    "selected": "Selected",
+    "offer received": "Offer Received",
+    "screening": "Screening",
+    "interview": "Interview",
+    "offer": "Offer",
+    "wishlist": "Wishlist",
+    "applying": "Applying",
+    "applied": "Applied",
+    "rejected": "Rejected",
+    "withdrawn": "Withdrawn",
+}
+
+
+def normalize_status(value):
+    if value is None:
+        return None
+    raw = str(value).strip()
+    if not raw:
+        return None
+    lowered = raw.lower()
+    if lowered in STATUS_ALIASES:
+        return STATUS_ALIASES[lowered]
+    for status in STATUSES:
+        if raw.lower() == status.lower():
+            return status
+    return raw
+
+
+def create_status_notification(db, user, job, previous_status=None):
+    if not job or not job.user_id:
+        return
+    current_status = normalize_status(job.status) or "Applied"
+    if previous_status is not None and normalize_status(previous_status) == current_status:
+        return
+    if current_status in {"Wishlist", "Applying"}:
+        return
+
+    title = f"{job.company}: {current_status}"
+    description = (
+        f"Your application for {job.role or 'the role'} has moved to {current_status}."
+    )
+    link = f"/applications/{job.id}"
+    existing = (
+        db.query(Notification)
+        .filter(
+            Notification.user_id == user.id,
+            Notification.job_id == job.id,
+            Notification.title == title,
+            Notification.notification_type == "status_update",
+        )
+        .first()
+    )
+    if existing:
+        return
+
+    notification = Notification(
+        user_id=user.id,
+        job_id=job.id,
+        title=title,
+        description=description,
+        notification_type="status_update",
+        company=job.company,
+        link=link,
+        metadata={"status": current_status},
+    )
+    db.add(notification)
 
 
 def owned(job, user):
@@ -71,9 +151,10 @@ def list_jobs(
         )
 
     if status:
-        if status not in STATUSES:
+        normalized_status = normalize_status(status)
+        if not normalized_status or normalized_status not in STATUSES:
             raise HTTPException(status_code=400, detail="Invalid status")
-        q = q.filter(JobApplication.status == status)
+        q = q.filter(JobApplication.status == normalized_status)
 
     return q.order_by(JobApplication.applied_date.desc(), JobApplication.id.desc()).all()
 
@@ -102,7 +183,7 @@ def create_or_update_job(
     user=Depends(get_current_user),
 ):
     payload = data.model_dump()
-    requested_status = payload.get("status") or "Applying"
+    requested_status = normalize_status(payload.get("status")) or "Applying"
 
     if requested_status not in STATUSES:
         raise HTTPException(status_code=400, detail="Invalid status")
@@ -124,12 +205,15 @@ def create_or_update_job(
         )
 
     if existing:
+        previous_status = existing.status
         for field, value in payload.items():
             if field == "status":
                 continue
             if value is not None:
                 setattr(existing, field, value)
         existing.status = requested_status
+        db.commit()
+        create_status_notification(db, user, existing, previous_status)
         db.commit()
         db.refresh(existing)
         return existing
@@ -139,6 +223,8 @@ def create_or_update_job(
     db.add(job)
     db.commit()
     db.refresh(job)
+    create_status_notification(db, user, job, None)
+    db.commit()
     return job
 
 
@@ -154,14 +240,19 @@ def update_job(
         raise HTTPException(status_code=404, detail="Job not found")
 
     updates = data.model_dump(exclude_unset=True)
+    previous_status = job.status
 
     if "status" in updates:
-        if updates["status"] not in STATUSES:
+        normalized_status = normalize_status(updates["status"])
+        if not normalized_status or normalized_status not in STATUSES:
             raise HTTPException(status_code=400, detail="Invalid status")
+        updates["status"] = normalized_status
 
     for field, value in updates.items():
         setattr(job, field, value)
 
+    db.commit()
+    create_status_notification(db, user, job, previous_status)
     db.commit()
     db.refresh(job)
     return job

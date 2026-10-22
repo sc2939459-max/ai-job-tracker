@@ -28,7 +28,23 @@ ChartJS.register(
   Filler
 );
 
-const statuses = ["Wishlist", "Applying", "Applied", "Screening", "Interview", "Offer", "Rejected", "Withdrawn"];
+const statuses = [
+  "Wishlist",
+  "Applying",
+  "Applied",
+  "Application Received",
+  "Under Review",
+  "Shortlisted",
+  "Interview Scheduled",
+  "Assessment",
+  "Selected",
+  "Offer Received",
+  "Screening",
+  "Interview",
+  "Offer",
+  "Rejected",
+  "Withdrawn",
+];
 
 const JOB_ROLE_OPTIONS = [
   "Data Analyst",
@@ -113,7 +129,15 @@ const RECOMMENDED_JOB_LOCATIONS = [
 
 const statusIcons = {
   Wishlist: "☆",
+  Applying: "↻",
   Applied: "●",
+  "Application Received": "✓",
+  "Under Review": "◉",
+  Shortlisted: "★",
+  "Interview Scheduled": "◎",
+  Assessment: "▣",
+  Selected: "✓",
+  "Offer Received": "✦",
   Screening: "◉",
   Interview: "◎",
   Offer: "✓",
@@ -2420,6 +2444,7 @@ function RecruiterMessagesPage({ user }) {
     }
   });
   const [messageFilter, setMessageFilter] = useState("all");
+  const [applicationFilter, setApplicationFilter] = useState(null);
   const [expandedMessageId, setExpandedMessageId] = useState(null);
 
   useEffect(() => {
@@ -2489,6 +2514,11 @@ function RecruiterMessagesPage({ user }) {
     });
 
     return roleCandidates.length === 1 ? roleCandidates[0] : null;
+  };
+
+  const filterTrackedMessages = (incoming, appList) => {
+    if (!Array.isArray(incoming) || !incoming.length) return [];
+    return incoming.filter((item) => !!findApplication(item, appList));
   };
 
   const applyEmailStatusUpdates = async (incoming, appList) => {
@@ -2561,12 +2591,13 @@ function RecruiterMessagesPage({ user }) {
       const connectedNow = Boolean(statusResponse.data?.connected);
       const incoming = Array.isArray(messageResponse.data) ? messageResponse.data : [];
       const appList = Array.isArray(applicationsResponse.data) ? applicationsResponse.data : [];
+      const trackedIncoming = filterTrackedMessages(incoming, appList);
       setConnected(connectedNow);
       setConnectedEmail(statusResponse.data?.email || "");
-      setMessages(incoming);
+      setMessages(trackedIncoming);
       setApplications(appList);
       setLastSync(new Date());
-      if (connectedNow) await applyEmailStatusUpdates(incoming, appList);
+      if (connectedNow) await applyEmailStatusUpdates(trackedIncoming, appList);
     } catch (err) {
       setMessages([]);
       const status = err.response?.status;
@@ -2601,9 +2632,10 @@ function RecruiterMessagesPage({ user }) {
       ]);
       const incoming = Array.isArray(response.data) ? response.data : [];
       const appList = Array.isArray(applicationsResponse.data) ? applicationsResponse.data : [];
-      setMessages(incoming);
+      const trackedIncoming = filterTrackedMessages(incoming, appList);
+      setMessages(trackedIncoming);
       setApplications(appList);
-      await applyEmailStatusUpdates(incoming, appList);
+      await applyEmailStatusUpdates(trackedIncoming, appList);
       setLastSync(new Date());
     } catch (err) {
       setError(err.response?.data?.detail || "Unable to sync recruiter messages.");
@@ -2627,10 +2659,63 @@ function RecruiterMessagesPage({ user }) {
 
   const newMessages = messages.filter((item) => item.id && !viewedMessageIds.includes(item.id));
   const interviewMessages = messages.filter((item) => classifyEmail(item) === "Interview").length;
+  const submittedStatuses = new Set([
+    "applied",
+    "application received",
+    "under review",
+    "shortlisted",
+    "interview scheduled",
+    "assessment",
+    "selected",
+    "offer received",
+    "screening",
+    "interview",
+    "offer",
+    "rejected",
+  ]);
+  const applicationStatuses = applications.map((application) =>
+    normalize(application.status)
+  );
+  const appliedJobsCount = applicationStatuses.filter((status) =>
+    submittedStatuses.has(status)
+  ).length;
+  const awaitingResponseCount = applicationStatuses.filter((status) =>
+    ["applied", "application received", "under review"].includes(status)
+  ).length;
+  const interviewStageCount = applicationStatuses.filter((status) =>
+    ["interview scheduled", "interview"].includes(status)
+  ).length;
+  const offersReceivedCount = applicationStatuses.filter((status) =>
+    ["selected", "offer received", "offer"].includes(status)
+  ).length;
   const updatedMessageRecords = updatedMessages.filter((record) =>
     messages.some((message) => message.id === record.id)
   );
   const statusUpdateCount = updatedMessageRecords.length;
+  const applicationFilterStatuses = {
+    appliedJobs: new Set([
+      "applied",
+      "application received",
+      "under review",
+      "shortlisted",
+      "interview scheduled",
+      "assessment",
+      "selected",
+      "offer received",
+      "screening",
+      "interview",
+      "offer",
+      "rejected",
+    ]),
+    awaitingResponse: new Set(["applied", "application received", "under review"]),
+    interviewStage: new Set(["interview scheduled", "interview"]),
+    offersReceived: new Set(["selected", "offer received", "offer"]),
+  };
+  const filteredApplications = applicationFilter
+    ? applications.filter((application) =>
+        applicationFilterStatuses[applicationFilter].has(normalize(application.status))
+      )
+    : [];
   const filteredMessages = messages.filter((item) => {
     if (messageFilter === "new") {
       return item.id &&
@@ -2644,7 +2729,13 @@ function RecruiterMessagesPage({ user }) {
   });
 
   const openMessageFilter = (filter) => {
+    setApplicationFilter(null);
     setMessageFilter(filter);
+    setExpandedMessageId(null);
+  };
+
+  const openApplicationFilter = (filter) => {
+    setApplicationFilter(filter);
     setExpandedMessageId(null);
   };
 
@@ -2682,11 +2773,15 @@ function RecruiterMessagesPage({ user }) {
         </div>
       </div>
 
-      <div className="recruiter-message-summary">
+      <div className="recruiter-message-summary" aria-label="Application and message summary">
         <button type="button" className={`recruiter-summary-tile ${messageFilter === "all" ? "active" : ""}`} aria-pressed={messageFilter === "all"} onClick={() => openMessageFilter("all")}><strong>{messages.length}</strong><span>Total messages</span></button>
         <button type="button" className={`recruiter-summary-tile ${messageFilter === "new" ? "active" : ""}`} aria-pressed={messageFilter === "new"} onClick={() => openMessageFilter("new")}><strong>{newMessages.length}</strong><span>New</span></button>
         <button type="button" className={`recruiter-summary-tile ${messageFilter === "interviews" ? "active" : ""}`} aria-pressed={messageFilter === "interviews"} onClick={() => openMessageFilter("interviews")}><strong>{interviewMessages}</strong><span>Interview signals</span></button>
         <button type="button" className={`recruiter-summary-tile ${messageFilter === "updated" ? "active" : ""}`} aria-pressed={messageFilter === "updated"} onClick={() => openMessageFilter("updated")}><strong>{statusUpdateCount}</strong><span>Applications updated</span></button>
+        <button type="button" className={`recruiter-summary-tile recruiter-summary-stat ${applicationFilter === "appliedJobs" ? "active" : ""}`} aria-pressed={applicationFilter === "appliedJobs"} title="Applications with a submitted or later status" onClick={() => openApplicationFilter("appliedJobs")}><strong>{appliedJobsCount}</strong><span>Applied jobs</span></button>
+        <button type="button" className={`recruiter-summary-tile recruiter-summary-stat ${applicationFilter === "awaitingResponse" ? "active" : ""}`} aria-pressed={applicationFilter === "awaitingResponse"} title="Applied, application received, or under review" onClick={() => openApplicationFilter("awaitingResponse")}><strong>{awaitingResponseCount}</strong><span>Awaiting response</span></button>
+        <button type="button" className={`recruiter-summary-tile recruiter-summary-stat ${applicationFilter === "interviewStage" ? "active" : ""}`} aria-pressed={applicationFilter === "interviewStage"} title="Interview scheduled or interview status" onClick={() => openApplicationFilter("interviewStage")}><strong>{interviewStageCount}</strong><span>Interview stage</span></button>
+        <button type="button" className={`recruiter-summary-tile recruiter-summary-stat ${applicationFilter === "offersReceived" ? "active" : ""}`} aria-pressed={applicationFilter === "offersReceived"} title="Selected, offer received, or offer status" onClick={() => openApplicationFilter("offersReceived")}><strong>{offersReceivedCount}</strong><span>Offers received</span></button>
       </div>
 
       {lastSync && <div className="recruiter-sync-meta">Last checked {lastSync.toLocaleTimeString("en-IN", { hour: "2-digit", minute: "2-digit" })} · checks every 5 minutes while this page is open</div>}
@@ -2701,7 +2796,44 @@ function RecruiterMessagesPage({ user }) {
         </div>
       )}
 
-      {loading ? <div className="loading">Checking Gmail for recruiter updates…</div> : filteredMessages.length ? (
+      {applicationFilter ? (
+        <div className="recruiter-application-results">
+          <div className="recruiter-application-results-heading">
+            <strong>
+              {applicationFilter === "appliedJobs" && "Applied jobs"}
+              {applicationFilter === "awaitingResponse" && "Applications awaiting response"}
+              {applicationFilter === "interviewStage" && "Interview-stage applications"}
+              {applicationFilter === "offersReceived" && "Offers received"}
+            </strong>
+            <span>{filteredApplications.length} application{filteredApplications.length === 1 ? "" : "s"}</span>
+          </div>
+          {filteredApplications.length ? (
+            <div className="applied-simple-list">
+              {filteredApplications.map((application) => (
+                <article className="applied-simple-card" key={application.id}>
+                  <div className="applied-simple-main">
+                    <strong>{application.company || "Company not specified"}</strong>
+                    <h3>{application.role || "Role not specified"}</h3>
+                    <div className="applied-simple-meta">
+                      <span>{application.location || "Location not specified"}</span>
+                      <span>Applied {application.applied_date || "date not recorded"}</span>
+                    </div>
+                  </div>
+                  <div className="applied-simple-status">
+                    <span className={`status-badge ${String(application.status || "Applied").toLowerCase()}`}>{application.status || "Applied"}</span>
+                    <small>Tracked application</small>
+                  </div>
+                </article>
+              ))}
+            </div>
+          ) : (
+            <div className="recruiter-empty">
+              <strong>No applications in this stage</strong>
+              <span>Applications will appear here when their status matches this summary.</span>
+            </div>
+          )}
+        </div>
+      ) : loading ? <div className="loading">Checking Gmail for recruiter updates…</div> : filteredMessages.length ? (
         <div className="recruiter-message-list">
           {filteredMessages.map((item) => {
             const detectedStatus = classifyEmail(item);

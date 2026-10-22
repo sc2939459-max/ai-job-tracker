@@ -33,7 +33,15 @@ def dashboard(
     # Applications and Interviews pages.
     status_names = [
         "Wishlist",
+        "Applying",
         "Applied",
+        "Application Received",
+        "Under Review",
+        "Shortlisted",
+        "Interview Scheduled",
+        "Assessment",
+        "Selected",
+        "Offer Received",
         "Screening",
         "Interview",
         "Offer",
