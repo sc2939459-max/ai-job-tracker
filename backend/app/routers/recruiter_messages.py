@@ -5,6 +5,8 @@ import hmac
 import logging
 import os
 import re
+import time
+import random
 from datetime import datetime, timedelta, timezone
 from email.utils import parseaddr, parsedate_to_datetime
 from typing import Any
@@ -452,21 +454,66 @@ def _gmail_get(
     params: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Make a Gmail API request and handle provider errors safely."""
-    try:
-        response = httpx.get(
-            url,
-            headers=headers,
-            params=params,
-            timeout=20,
+    
+    response = None
+
+    for attempt in range(4):
+        try:
+            response = httpx.get(
+                url,
+                headers=headers,
+                params=params,
+                timeout=20,
+            )
+        except httpx.TimeoutException:
+            logger.warning("Gmail API request timed out.")
+            raise HTTPException(
+                status_code=504,
+                detail="Gmail took too long to respond. Please try again.",
+            )
+        except httpx.RequestError:
+            logger.exception("Could not connect to Gmail API.")
+            raise HTTPException(
+                status_code=502,
+                detail="Could not connect to Gmail. Please try again later.",
+            )
+
+        if response.status_code != 403:
+            break
+
+        try:
+            payload = response.json()
+            error = payload.get("error", {})
+            errors = error.get("errors", []) if isinstance(error, dict) else []
+            reasons = [
+                str(item["reason"])
+                for item in errors
+                if isinstance(item, dict) and item.get("reason")
+            ]
+        except (ValueError, AttributeError, TypeError):
+            reasons = []
+
+        rate_limit_reasons = {
+            "rateLimitExceeded",
+            "userRateLimitExceeded",
+        }
+
+        if not rate_limit_reasons.intersection(reasons):
+            break
+
+        if attempt == 3:
+            logger.warning("Gmail API rate limit retries exhausted.")
+            break
+
+        delay = (2 ** attempt) + random.uniform(0, 0.5)
+        logger.warning(
+            "Gmail API rate limited; retrying in %.2f seconds (attempt %s/4).",
+            delay,
+            attempt + 1,
         )
-    except httpx.TimeoutException:
-        logger.warning("Gmail API request timed out.")
-        raise HTTPException(
-            status_code=504,
-            detail="Gmail took too long to respond. Please try again.",
-        )
-    except httpx.RequestError:
-        logger.exception("Could not connect to Gmail API.")
+        time.sleep(delay)
+
+    if response is None:
         raise HTTPException(
             status_code=502,
             detail="Could not connect to Gmail. Please try again later.",
@@ -478,6 +525,46 @@ def _gmail_get(
             status_code=502,
             detail="Google authorization expired. Reconnect Gmail.",
         )
+
+    if response.status_code == 403:
+        reasons = []
+        try:
+            payload = response.json()
+            error = payload.get("error", {})
+            if isinstance(error, dict):
+                reasons = [
+                    str(item["reason"])
+                    for item in error.get("errors", [])
+                    if isinstance(item, dict) and item.get("reason")
+                ]
+                if not reasons and error.get("status"):
+                    reasons = [str(error["status"])]
+        except (ValueError, AttributeError, TypeError):
+            pass
+
+        endpoint = (
+            "message detail" if "/messages/" in url else "message list"
+        )
+        logger.warning(
+            "Gmail API returned 403 for %s; reasons=%s",
+            endpoint,
+            reasons or ["not provided"],
+        )
+        raise HTTPException(
+            status_code=503 if {
+                "rateLimitExceeded",
+                "userRateLimitExceeded",
+            }.intersection(reasons) else 403,
+            detail=(
+                "Gmail rate limit reached. Please wait and try again."
+                if {
+                    "rateLimitExceeded",
+                    "userRateLimitExceeded",
+                }.intersection(reasons)
+                else "Gmail denied access to this request."
+            ),
+        )
+
 
     if response.status_code == 403:
         reasons: list[str] = []
@@ -562,7 +649,7 @@ def _fetch_messages(mailbox: GoogleMailbox) -> list[dict[str, Any]]:
     access_token = _refresh_access_token(mailbox)
     headers = {"Authorization": f"Bearer {access_token}"}
     params: dict[str, Any] = {
-        "maxResults": 100,
+        "maxResults": 25,
         "q": (
             'newer_than:180d {interview recruiter hiring application candidate '
             'assessment offer "job opportunity" rejection rejected "not selected" '
