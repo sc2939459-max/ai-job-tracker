@@ -172,6 +172,7 @@ def _classify_application_outcome(subject: str, body: str) -> str | None:
         r"\bwe regret to inform you\b",
         r"\bnot moving forward with (?:your )?(?:application|candidacy)\b",
         r"\bwill not be moving forward\b",
+        r"\bdecided to move forward with another candidate\b",
         r"\bwe have decided not to proceed with (?:your )?(?:application|candidacy)\b",
         r"\bhas decided not to proceed with (?:your )?(?:application|candidacy)\b",
         r"\bhas decided not to move forward with (?:your )?(?:application|candidacy)\b",

@@ -45,3 +45,18 @@ def test_ambiguous_same_company_applications_are_not_guessed():
         "sender": "careers@acme.com",
     }
     assert _match_application(email, [app1, app2]) is None
+
+def test_smiths_detection_rejection_email_is_detected():
+    subject = "Thank you for your interest in Software Engineer position at Smiths Detection"
+    body = (
+        "After careful consideration, we have decided to move forward "
+        "with another candidate for this particular role. "
+        "While we won't be progressing with your application at this time."
+    )
+
+    assert _classify_application_outcome(subject, body) == "Rejected"
+    assert _is_recruiter_message(
+        subject,
+        "notifications@smartrecruiters.com",
+        body,
+    )
