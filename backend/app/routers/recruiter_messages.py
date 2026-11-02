@@ -2,11 +2,10 @@ import base64
 import binascii
 import html
 import hmac
+import json
 import logging
 import os
 import re
-import time
-import random
 from datetime import datetime, timedelta, timezone
 from email.utils import parseaddr, parsedate_to_datetime
 from typing import Any
@@ -32,12 +31,29 @@ class ManualMatchRequest(BaseModel):
     application_id: int
 
 
+class GmailRateLimitError(HTTPException):
+    def __init__(
+        self,
+        retry_after_seconds: int = 60,
+        partial_messages: list[dict[str, Any]] | None = None,
+    ):
+        self.retry_after_seconds = retry_after_seconds
+        self.partial_messages = partial_messages or []
+        super().__init__(
+            status_code=503,
+            detail="Gmail rate limit reached. Please wait and try again.",
+            headers={"Retry-After": str(retry_after_seconds)},
+        )
+
+
 GOOGLE_AUTH_URL = "https://accounts.google.com/o/oauth2/v2/auth"
 GOOGLE_TOKEN_URL = "https://oauth2.googleapis.com/token"
 GMAIL_API = "https://gmail.googleapis.com/gmail/v1/users/me"
 GOOGLE_SCOPES = "https://www.googleapis.com/auth/gmail.readonly"
 ALGORITHM = "HS256"
 GMAIL_SYNC_INTERVAL_SECONDS = 60
+GMAIL_SYNC_PAGE_SIZE = 10
+GMAIL_RATE_LIMIT_MAX_COOLDOWN_SECONDS = 900
 GMAIL_MESSAGE_PREFIX = "gmail:"
 GMAIL_SYNC_MARKER_URL = "gmail:sync-state"
 
@@ -281,6 +297,24 @@ def _phrase_in_text(phrase: str, text: str) -> bool:
     )
 
 
+def _role_mentioned(role: str, text: str) -> bool:
+    if not _phrase_in_text(role, text):
+        return False
+    tokens = _normalize(text).split()
+    role_tokens = _normalize(role).split()
+    for index in range(len(tokens) - len(role_tokens) + 1):
+        if tokens[index:index + len(role_tokens)] != role_tokens:
+            continue
+        following = tokens[index + len(role_tokens):index + len(role_tokens) + 1]
+        if following and following[0] in {
+            "i", "ii", "iii", "iv", "senior", "junior", "staff", "lead",
+            "principal", "associate",
+        }:
+            continue
+        return True
+    return False
+
+
 def _reference_ids(item: dict[str, Any]) -> set[str]:
     text = _message_text(item)
     refs = {
@@ -335,7 +369,7 @@ def _match_application(
             return None
         role_matches = [
             app for app in applications
-            if _phrase_in_text(app.role or "", _message_text(item))
+            if _role_mentioned(app.role or "", _message_text(item))
         ]
         return role_matches[0] if len(role_matches) == 1 else None
 
@@ -344,7 +378,7 @@ def _match_application(
 
     role_matches = [
         app for app in company_matches
-        if _phrase_in_text(app.role or "", _message_text(item))
+        if _role_mentioned(app.role or "", _message_text(item))
     ]
     if len(role_matches) == 1:
         return role_matches[0]
@@ -450,6 +484,7 @@ def _process_gmail_messages(
     db: Session,
     user_id: int,
     messages: list[dict[str, Any]],
+    commit: bool = True,
 ) -> list[dict[str, Any]]:
     applications = (
         db.query(JobApplication)
@@ -542,15 +577,18 @@ def _process_gmail_messages(
         changed = True
 
     if changed:
-        try:
-            db.commit()
-        except Exception:
-            db.rollback()
-            logger.exception("Failed to save Gmail messages and application updates")
-            raise HTTPException(
-                status_code=500,
-                detail="Could not save Gmail messages or application statuses.",
-            )
+        if commit:
+            try:
+                db.commit()
+            except Exception:
+                db.rollback()
+                logger.exception("Failed to save Gmail messages and application updates")
+                raise HTTPException(
+                    status_code=500,
+                    detail="Could not save Gmail messages or application statuses.",
+                )
+        else:
+            db.flush()
     return list(updates_by_message.values())
 
 
@@ -642,84 +680,69 @@ def _refresh_access_token(mailbox: GoogleMailbox) -> str:
     return access_token
 
 
+def _retry_after_seconds(value: str | None) -> int:
+    if not value:
+        return GMAIL_SYNC_INTERVAL_SECONDS
+    try:
+        return min(
+            max(int(float(value)), 1),
+            GMAIL_RATE_LIMIT_MAX_COOLDOWN_SECONDS,
+        )
+    except ValueError:
+        try:
+            retry_time = parsedate_to_datetime(value)
+            if retry_time.tzinfo is None:
+                retry_time = retry_time.replace(tzinfo=timezone.utc)
+            seconds = int((retry_time - datetime.now(timezone.utc)).total_seconds())
+            return min(
+                max(seconds, 1),
+                GMAIL_RATE_LIMIT_MAX_COOLDOWN_SECONDS,
+            )
+        except (TypeError, ValueError, OverflowError):
+            return GMAIL_SYNC_INTERVAL_SECONDS
+
+
 def _gmail_get(
     url: str,
     headers: dict[str, str],
     params: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """Make a Gmail API request and handle provider errors safely."""
+    """Make one Gmail API request; mailbox sync applies cooldown after quota errors."""
 
-    response = None
-
-    for attempt in range(4):
-        try:
-            response = httpx.get(
-                url,
-                headers=headers,
-                params=params,
-                timeout=20,
-            )
-        except httpx.TimeoutException:
-            logger.warning("Gmail API request timed out.")
-            raise HTTPException(
-                status_code=504,
-                detail="Gmail took too long to respond. Please try again.",
-            )
-        except httpx.RequestError:
-            logger.exception("Could not connect to Gmail API.")
-            raise HTTPException(
-                status_code=502,
-                detail="Could not connect to Gmail. Please try again later.",
-            )
-
-        reasons: set[str] = set()
-        try:
-            payload = response.json()
-            error = payload.get("error", {})
-            errors = error.get("errors", []) if isinstance(error, dict) else []
-            reasons = {
-                str(item["reason"])
-                for item in errors
-                if isinstance(item, dict) and item.get("reason")
-            }
-        except (ValueError, AttributeError, TypeError):
-            pass
-
-        quota_403 = response.status_code == 403 and bool(
-            reasons.intersection({"rateLimitExceeded", "userRateLimitExceeded"})
+    try:
+        response = httpx.get(
+            url,
+            headers=headers,
+            params=params,
+            timeout=20,
         )
-        if response.status_code != 429 and not quota_403:
-            break
-
-        if attempt == 3:
-            logger.warning("Gmail API rate limit retries exhausted.")
-            break
-
-        retry_after = response.headers.get("Retry-After")
-        try:
-            delay = min(max(float(retry_after), 0), 30) if retry_after else 2**attempt
-        except ValueError:
-            try:
-                retry_time = parsedate_to_datetime(retry_after)
-                delay = min(
-                    max((retry_time - datetime.now(timezone.utc)).total_seconds(), 0),
-                    30,
-                )
-            except (TypeError, ValueError, OverflowError):
-                delay = 2**attempt
-        delay += random.uniform(0, 0.5)
-        logger.warning(
-            "Gmail API rate limited; retrying in %.2f seconds (attempt %s/4).",
-            delay,
-            attempt + 1,
+    except httpx.TimeoutException:
+        logger.warning("Gmail API request timed out.")
+        raise HTTPException(
+            status_code=504,
+            detail="Gmail took too long to respond. Please try again.",
         )
-        time.sleep(delay)
-
-    if response is None:
+    except httpx.RequestError:
+        logger.exception("Could not connect to Gmail API.")
         raise HTTPException(
             status_code=502,
             detail="Could not connect to Gmail. Please try again later.",
         )
+
+    reasons: set[str] = set()
+    try:
+        payload = response.json()
+        error = payload.get("error", {})
+        errors = error.get("errors", []) if isinstance(error, dict) else []
+        reasons = {
+            str(item["reason"])
+            for item in errors
+            if isinstance(item, dict) and item.get("reason")
+        }
+        if not reasons and isinstance(error, dict) and error.get("status"):
+            reasons = {str(error["status"])}
+    except (ValueError, AttributeError, TypeError):
+        pass
 
     if response.status_code == 401:
         logger.warning("Gmail API rejected the access token.")
@@ -728,55 +751,38 @@ def _gmail_get(
             detail="Google authorization expired. Reconnect Gmail.",
         )
 
-    if response.status_code == 403:
-        reasons: set[str] = set()
-        try:
-            payload = response.json()
-            error = payload.get("error", {})
-            if isinstance(error, dict):
-                reasons = {
-                    str(item["reason"])
-                    for item in error.get("errors", [])
-                    if isinstance(item, dict) and item.get("reason")
-                }
-                if not reasons and error.get("status"):
-                    reasons = {str(error["status"])}
-        except (ValueError, AttributeError, TypeError):
-            pass
-
-        rate_limited = bool(
-            reasons.intersection({"rateLimitExceeded", "userRateLimitExceeded"})
-        )
-
+    rate_limited = response.status_code == 429 or (
+        response.status_code == 403
+        and bool(reasons.intersection({"rateLimitExceeded", "userRateLimitExceeded"}))
+    )
+    if rate_limited:
         endpoint = (
             "message detail" if "/messages/" in url else "message list"
         )
         logger.warning(
-            "Gmail API returned 403 for %s; reasons=%s",
+            "Gmail API rate limited %s; status=%s reasons=%s",
             endpoint,
+            response.status_code,
             sorted(reasons) or ["not provided"],
         )
+        raise GmailRateLimitError(
+            _retry_after_seconds(response.headers.get("Retry-After"))
+        )
 
+    if response.status_code == 403:
+        logger.warning(
+            "Gmail API returned 403; reasons=%s",
+            sorted(reasons) or ["not provided"],
+        )
         raise HTTPException(
-            status_code=503 if rate_limited else 403,
-            detail=(
-                "Gmail rate limit reached. Please wait and try again."
-                if rate_limited
-                else "Gmail denied access to this request."
-            ),
+            status_code=403,
+            detail="Gmail denied access to this request.",
         )
 
     if response.status_code == 404:
         raise HTTPException(
             status_code=404,
             detail="Gmail message was not found.",
-        )
-
-    if response.status_code == 429:
-        logger.warning("Gmail API rate limit reached.")
-        raise HTTPException(
-            status_code=503,
-            detail="Gmail rate limit reached. Try again later.",
         )
 
     if response.status_code >= 500:
@@ -816,49 +822,33 @@ def _gmail_get(
     return data
 
 
-def _fetch_messages(db: Session, mailbox: GoogleMailbox) -> list[dict[str, Any]]:
+def _fetch_messages(
+    db: Session,
+    mailbox: GoogleMailbox,
+    page_token: str | None = None,
+    after_timestamp: int | None = None,
+) -> tuple[list[dict[str, Any]], str | None]:
     access_token = _refresh_access_token(mailbox)
     headers = {"Authorization": f"Bearer {access_token}"}
     params: dict[str, Any] = {
-        "maxResults": 100,
+        "maxResults": GMAIL_SYNC_PAGE_SIZE,
         "q": (
-            'newer_than:180d {interview recruiter hiring application candidate '
-            'assessment offer "job opportunity" rejection rejected "not selected" '
-            '"not moving forward" "regret to inform" unsuccessful '
-            '"position has been filled" "another candidate"}'
+            'newer_than:180d {"another candidate" "not moving forward" '
+            '"regret to inform" "position has been filled" "application received" '
+            '"under review" shortlisted interview assessment "offer letter" '
+            '"offer of employment" "coding challenge" "technical test" '
+            '"withdrawn your application"}'
         ),
     }
-    first_sync = (
-        db.query(RecruiterMessage.id)
-        .filter(
-            RecruiterMessage.user_id == mailbox.user_id,
-            RecruiterMessage.source == "gmail_sync",
-            RecruiterMessage.external_url == GMAIL_SYNC_MARKER_URL,
-        )
-        .first()
-        is None
-    )
-    if not first_sync and mailbox.updated_at:
-        marker = mailbox.updated_at
-        if marker.tzinfo is None:
-            marker = marker.replace(tzinfo=timezone.utc)
-        params["q"] += f" after:{max(int(marker.timestamp()) - 120, 0)}"
+    if after_timestamp:
+        params["q"] += f" after:{after_timestamp}"
+    if page_token:
+        params["pageToken"] = page_token
 
-    references: list[dict[str, Any]] = []
-    page_token = None
-
-    for _ in range(3):
-        page_params = dict(params)
-        if page_token:
-            page_params["pageToken"] = page_token
-
-        page = _gmail_get(f"{GMAIL_API}/messages", headers, page_params)
-        references.extend(
-            ref for ref in page.get("messages", []) if ref.get("id")
-        )
-        page_token = page.get("nextPageToken")
-        if not page_token:
-            break
+    page = _gmail_get(f"{GMAIL_API}/messages", headers, params)
+    references = [
+        ref for ref in page.get("messages", []) if ref.get("id")
+    ]
 
     external_urls = [
         _gmail_external_url(str(ref["id"]))
@@ -890,6 +880,9 @@ def _fetch_messages(db: Session, mailbox: GoogleMailbox) -> list[dict[str, Any]]
                 headers,
                 {"format": "full"},
             )
+        except GmailRateLimitError as exc:
+            exc.partial_messages = messages
+            raise
         except HTTPException as exc:
             if exc.status_code == 404:
                 logger.info("Skipping Gmail message that no longer exists")
@@ -904,53 +897,170 @@ def _fetch_messages(db: Session, mailbox: GoogleMailbox) -> list[dict[str, Any]]
             messages.append(item)
 
     messages.sort(key=lambda item: item.get("receivedAt") or "", reverse=True)
-    return messages
+    return messages, page.get("nextPageToken")
 
 
 def _sync_messages_for_user(
     db: Session,
     user_id: int,
     mailbox: GoogleMailbox,
-    force: bool = False,
 ) -> dict[str, Any]:
-    has_completed_sync = (
-        db.query(RecruiterMessage.id)
+    mailbox = (
+        db.query(GoogleMailbox)
+        .filter(GoogleMailbox.user_id == user_id)
+        .with_for_update()
+        .populate_existing()
+        .first()
+    )
+    if mailbox is None:
+        raise HTTPException(status_code=409, detail="Gmail is not connected.")
+
+    sync_marker = (
+        db.query(RecruiterMessage)
         .filter(
             RecruiterMessage.user_id == user_id,
             RecruiterMessage.source == "gmail_sync",
             RecruiterMessage.external_url == GMAIL_SYNC_MARKER_URL,
         )
         .first()
-        is not None
     )
-    first_sync = not has_completed_sync
-    now = datetime.now(timezone.utc).replace(tzinfo=None)
+    now_utc = datetime.now(timezone.utc)
+    now = now_utc.replace(tzinfo=None)
+
+    try:
+        cursor = json.loads(sync_marker.body) if sync_marker and sync_marker.body else {}
+    except json.JSONDecodeError:
+        logger.warning(
+            "Resetting invalid Gmail synchronization cursor for user_id=%s",
+            user_id,
+        )
+        cursor = {}
+
+    cooldown_until = cursor.get("cooldown_until")
+    if cooldown_until:
+        try:
+            cooldown_time = datetime.fromisoformat(cooldown_until)
+            if cooldown_time.tzinfo is None:
+                cooldown_time = cooldown_time.replace(tzinfo=timezone.utc)
+        except (TypeError, ValueError):
+            cooldown_time = None
+        if cooldown_time and cooldown_time > now_utc:
+            retry_after = max(int((cooldown_time - now_utc).total_seconds()), 1)
+            db.rollback()
+            raise GmailRateLimitError(retry_after)
+
     if (
-        not force
-        and not first_sync
-        and mailbox.updated_at
+        mailbox.updated_at
         and (now - mailbox.updated_at).total_seconds() < GMAIL_SYNC_INTERVAL_SECONDS
     ):
+        cached_messages = _list_gmail_messages(db, user_id)
+        checked_at = mailbox.updated_at.isoformat()
+        db.rollback()
         return {
-            "messages": _list_gmail_messages(db, user_id),
+            "messages": cached_messages,
             "applicationUpdates": [],
-            "checkedAt": mailbox.updated_at.isoformat(),
+            "checkedAt": checked_at,
         }
 
-    messages = _fetch_messages(db, mailbox)
-    updates = _process_gmail_messages(db, user_id, messages)
-    mailbox.updated_at = now
-    if first_sync:
-        db.add(
-            RecruiterMessage(
-                user_id=user_id,
-                subject="",
-                body="",
-                category="sync_state",
-                source="gmail_sync",
-                external_url=GMAIL_SYNC_MARKER_URL,
-            )
+    mode = cursor.get("mode", "backfill")
+    if mode not in {"backfill", "incremental"}:
+        mode = "backfill"
+        cursor = {}
+    after_timestamp = cursor.get("after") if mode == "incremental" else None
+    try:
+        after_timestamp = int(after_timestamp) if after_timestamp else None
+    except (TypeError, ValueError):
+        after_timestamp = None
+
+    if sync_marker is None:
+        sync_marker = RecruiterMessage(
+            user_id=user_id,
+            subject="",
+            body="",
+            category="sync_state",
+            source="gmail_sync",
+            external_url=GMAIL_SYNC_MARKER_URL,
         )
+        db.add(sync_marker)
+
+    try:
+        messages, next_page_token = _fetch_messages(
+            db,
+            mailbox,
+            page_token=cursor.get("page_token"),
+            after_timestamp=after_timestamp,
+        )
+    except GmailRateLimitError as exc:
+        try:
+            _process_gmail_messages(
+                db,
+                user_id,
+                exc.partial_messages,
+                commit=False,
+            )
+        except Exception:
+            db.rollback()
+            raise
+        try:
+            failures = max(int(cursor.get("rate_limit_count", 0)), 0) + 1
+        except (TypeError, ValueError):
+            failures = 1
+        cooldown = min(
+            max(
+                exc.retry_after_seconds,
+                GMAIL_SYNC_INTERVAL_SECONDS * (2 ** min(failures - 1, 4)),
+            ),
+            GMAIL_RATE_LIMIT_MAX_COOLDOWN_SECONDS,
+        )
+        cursor["mode"] = mode
+        if after_timestamp:
+            cursor["after"] = after_timestamp
+        cursor["rate_limit_count"] = failures
+        cursor["cooldown_until"] = (
+            now_utc + timedelta(seconds=cooldown)
+        ).isoformat()
+        sync_marker.body = json.dumps(cursor)
+        sync_marker.updated_at = now
+        try:
+            db.commit()
+        except Exception:
+            db.rollback()
+            logger.exception("Failed to save Gmail rate-limit cooldown")
+            raise HTTPException(
+                status_code=500,
+                detail="Could not save Gmail synchronization state.",
+            )
+        logger.warning(
+            "Gmail sync paused for user_id=%s after quota response; cooldown=%s seconds",
+            user_id,
+            cooldown,
+        )
+        raise GmailRateLimitError(cooldown, exc.partial_messages)
+    except Exception:
+        db.rollback()
+        raise
+
+    try:
+        updates = _process_gmail_messages(db, user_id, messages, commit=False)
+    except Exception:
+        db.rollback()
+        raise
+    mailbox.updated_at = now
+    if next_page_token:
+        next_cursor = {
+            "mode": mode,
+            "page_token": next_page_token,
+        }
+        if after_timestamp:
+            next_cursor["after"] = after_timestamp
+    else:
+        next_cursor = {
+            "mode": "incremental",
+            "after": max(int(now.replace(tzinfo=timezone.utc).timestamp()) - 120, 0),
+        }
+    next_cursor["rate_limit_count"] = 0
+    sync_marker.body = json.dumps(next_cursor)
+    sync_marker.updated_at = now
     try:
         db.commit()
     except Exception:
@@ -1135,6 +1245,14 @@ def list_messages(
     return _sync_messages_for_user(db, user.id, mailbox)["messages"]
 
 
+@router.get("/messages")
+def get_stored_messages(
+    db: Session = Depends(get_db),
+    user=Depends(get_current_user),
+):
+    return _list_gmail_messages(db, user.id)
+
+
 @router.post("/sync")
 def sync_messages(
     db: Session = Depends(get_db),
@@ -1150,7 +1268,7 @@ def sync_messages(
             status_code=409,
             detail="Gmail is not connected. Connect Gmail first.",
         )
-    return _sync_messages_for_user(db, user.id, mailbox, force=True)["messages"]
+    return _sync_messages_for_user(db, user.id, mailbox)["messages"]
 
 
 @router.put("/{message_id}/review")
