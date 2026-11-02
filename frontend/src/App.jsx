@@ -1,4 +1,4 @@
-import React, { useEffect, useMemo, useState } from "react";
+import React, { useEffect, useMemo, useRef, useState } from "react";
 import api from "./api";
 import { Doughnut, Bar, Line, Radar } from "react-chartjs-2";
 import {
@@ -2428,6 +2428,7 @@ function RecruiterMessagesPage({ user }) {
   const [connectedEmail, setConnectedEmail] = useState("");
   const [error, setError] = useState("");
   const [lastSync, setLastSync] = useState(null);
+  const syncInProgressRef = useRef(false);
   const readMessagesKey = `jobtracker_read_recruiter_messages_${user?.email || "guest"}`;
   const updatedMessagesKey = `jobtracker_updated_recruiter_messages_${user?.email || "guest"}`;
   const [viewedMessageIds, setViewedMessageIds] = useState(() => {
@@ -2484,6 +2485,23 @@ function RecruiterMessagesPage({ user }) {
     localStorage.setItem(updatedMessagesKey, JSON.stringify(updated));
   };
 
+  const refreshStoredData = async () => {
+    const [storedMessagesResponse, applicationsResponse] = await Promise.all([
+      api.get("/recruiter-messages/messages"),
+      api.get("/jobs"),
+    ]);
+    const storedMessages = Array.isArray(storedMessagesResponse.data)
+      ? storedMessagesResponse.data
+      : [];
+    const appList = Array.isArray(applicationsResponse.data)
+      ? applicationsResponse.data
+      : [];
+    setMessages(storedMessages);
+    setApplications(appList);
+    refreshReviewState(storedMessages);
+    return storedMessages;
+  };
+
   const loadMessages = async () => {
     setLoading(true);
     setError("");
@@ -2493,19 +2511,10 @@ function RecruiterMessagesPage({ user }) {
       setConnected(connectedNow);
       setConnectedEmail(statusResponse.data?.email || "");
 
-      const [storedMessagesResponse, applicationsResponse] = await Promise.all([
-        api.get("/recruiter-messages/messages"),
-        api.get("/jobs"),
-      ]);
-      const storedMessages = Array.isArray(storedMessagesResponse.data)
-        ? storedMessagesResponse.data
-        : [];
-      const appList = Array.isArray(applicationsResponse.data) ? applicationsResponse.data : [];
-      setMessages(storedMessages);
-      setApplications(appList);
-      refreshReviewState(storedMessages);
+      await refreshStoredData();
 
-      if (connectedNow) {
+      if (connectedNow && !syncInProgressRef.current) {
+        syncInProgressRef.current = true;
         try {
           const syncResponse = await api.get("/recruiter-messages");
           const syncedMessages = Array.isArray(syncResponse.data) ? syncResponse.data : [];
@@ -2519,8 +2528,22 @@ function RecruiterMessagesPage({ user }) {
           setError(
             syncError.response?.data?.detail || "Gmail sync failed. Your saved messages are still available."
           );
+          try {
+            const savedMessages = await refreshStoredData();
+            if (savedMessages.some((item) => item.statusUpdated)) {
+              window.dispatchEvent(new Event("jobtracker:data-changed"));
+            }
+          } catch (refreshError) {
+            setError(
+              `${syncError.response?.data?.detail || "Gmail sync failed."} Saved messages could not be refreshed: ${
+                refreshError.response?.data?.detail || refreshError.message
+              }`
+            );
+          }
+        } finally {
+          syncInProgressRef.current = false;
         }
-      } else {
+      } else if (!connectedNow) {
         setLastSync(null);
       }
     } catch (err) {
@@ -2547,6 +2570,8 @@ function RecruiterMessagesPage({ user }) {
   };
 
   const syncMessages = async () => {
+    if (syncInProgressRef.current) return;
+    syncInProgressRef.current = true;
     setSyncing(true);
     setError("");
     try {
@@ -2563,8 +2588,21 @@ function RecruiterMessagesPage({ user }) {
       }
     } catch (err) {
       setError(err.response?.data?.detail || "Unable to sync recruiter messages.");
+      try {
+        const savedMessages = await refreshStoredData();
+        if (savedMessages.some((item) => item.statusUpdated)) {
+          window.dispatchEvent(new Event("jobtracker:data-changed"));
+        }
+      } catch (refreshError) {
+        setError(
+          `${err.response?.data?.detail || "Unable to sync recruiter messages."} Saved messages could not be refreshed: ${
+            refreshError.response?.data?.detail || refreshError.message
+          }`
+        );
+      }
     } finally {
       setSyncing(false);
+      syncInProgressRef.current = false;
     }
   };
 

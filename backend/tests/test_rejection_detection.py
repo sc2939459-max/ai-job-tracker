@@ -11,7 +11,7 @@ from sqlalchemy.orm import Session, sessionmaker
 from sqlalchemy.pool import StaticPool
 
 from app.database import Base
-from app.models import JobApplication, RecruiterMessage, User
+from app.models import GoogleMailbox, JobApplication, RecruiterMessage, User
 from app.routers.recruiter_messages import (
     ManualMatchRequest,
     _classify_application_outcome,
@@ -72,6 +72,17 @@ def _create_application(
     db.commit()
     db.refresh(application)
     return application
+
+
+def _create_mailbox(db: Session, user_id: int) -> GoogleMailbox:
+    mailbox = GoogleMailbox(
+        user_id=user_id,
+        email="test@example.com",
+        refresh_token="unused",
+    )
+    db.add(mailbox)
+    db.commit()
+    return mailbox
 
 
 def _smiths_email(message_id: str = "smiths-rejection-1") -> dict:
@@ -383,22 +394,21 @@ def test_message_matching_is_scoped_to_the_current_user(db_session):
         ),
     ],
 )
-def test_gmail_rate_limits_retry_once_with_server_error_recovery(
+def test_gmail_rate_limits_defer_retry_to_sync_cooldown(
     monkeypatch, rate_response
 ):
-    responses = [rate_response, httpx.Response(200, json={"messages": []})]
     request_count = []
     monkeypatch.setattr(
         recruiter_messages_router.httpx,
         "get",
-        lambda *args, **kwargs: request_count.append(True) or responses.pop(0),
+        lambda *args, **kwargs: request_count.append(True) or rate_response,
     )
-    monkeypatch.setattr(recruiter_messages_router.time, "sleep", lambda _delay: None)
 
-    result = recruiter_messages_router._gmail_get("https://gmail.test/messages", {})
+    with pytest.raises(recruiter_messages_router.GmailRateLimitError) as error:
+        recruiter_messages_router._gmail_get("https://gmail.test/messages", {})
 
-    assert result == {"messages": []}
-    assert len(request_count) == 2
+    assert error.value.status_code == 503
+    assert len(request_count) == 1
 
 
 def test_fetch_skips_detail_requests_for_already_persisted_message(
@@ -435,7 +445,7 @@ def test_fetch_skips_detail_requests_for_already_persisted_message(
     )
 
     def fake_gmail_get(url, headers, params=None):
-        requested_urls.append(url)
+        requested_urls.append((url, params))
         if url.endswith("/messages"):
             return {"messages": [{"id": "already-seen"}, {"id": "new-message"}]}
         return {
@@ -459,19 +469,24 @@ def test_fetch_skips_detail_requests_for_already_persisted_message(
 
     assert len(fetched) == 1
     assert next_page_token is None
-    assert requested_urls.count("https://gmail.googleapis.com/gmail/v1/users/me/messages/new-message") == 1
-    assert not any(url.endswith("/messages/already-seen") for url in requested_urls)
+    detail_requests = [
+        url for url, _ in requested_urls
+        if url.endswith("/messages/new-message")
+    ]
+    assert len(detail_requests) == 1
+    assert not any(url.endswith("/messages/already-seen") for url, _ in requested_urls)
+    assert next(params for url, params in requested_urls if url.endswith("/messages"))[
+        "maxResults"
+    ] == 10
 
 
 def test_gmail_backfill_cursor_advances_without_repeating_list_pages(
     db_session, monkeypatch
 ):
     user = _create_user(db_session)
-    mailbox = SimpleNamespace(
-        user_id=user.id,
-        updated_at=datetime.now(timezone.utc).replace(tzinfo=None)
-        - timedelta(minutes=5),
-    )
+    mailbox = _create_mailbox(db_session, user.id)
+    mailbox.updated_at = datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(minutes=5)
+    db_session.commit()
     requested_tokens = []
     responses = [([], "next-backfill-page"), ([], None)]
 
@@ -480,8 +495,10 @@ def test_gmail_backfill_cursor_advances_without_repeating_list_pages(
         return responses.pop(0)
 
     monkeypatch.setattr(recruiter_messages_router, "_fetch_messages", fake_fetch)
-    _sync_messages_for_user(db_session, user.id, mailbox, force=True)
-    _sync_messages_for_user(db_session, user.id, mailbox, force=True)
+    _sync_messages_for_user(db_session, user.id, mailbox)
+    mailbox.updated_at = datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(minutes=5)
+    db_session.commit()
+    _sync_messages_for_user(db_session, user.id, mailbox)
 
     marker = (
         db_session.query(RecruiterMessage)
@@ -495,3 +512,56 @@ def test_gmail_backfill_cursor_advances_without_repeating_list_pages(
     assert requested_tokens == [(None, None), ("next-backfill-page", None)]
     assert cursor["mode"] == "incremental"
     assert "after" in cursor
+
+
+def test_rate_limit_persists_partial_messages_and_cools_down_mailbox(
+    db_session, monkeypatch
+):
+    user = _create_user(db_session)
+    application = _create_application(db_session, user.id)
+    application.applied_date = date(2026, 10, 10)
+    mailbox = _create_mailbox(db_session, user.id)
+    mailbox.updated_at = datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(minutes=5)
+    db_session.commit()
+
+    def rate_limited_fetch(*_args, **_kwargs):
+        raise recruiter_messages_router.GmailRateLimitError(
+            retry_after_seconds=1,
+            partial_messages=[_smiths_email("partial-smiths-rejection")],
+        )
+
+    monkeypatch.setattr(
+        recruiter_messages_router,
+        "_fetch_messages",
+        rate_limited_fetch,
+    )
+    with pytest.raises(recruiter_messages_router.GmailRateLimitError) as first_error:
+        _sync_messages_for_user(db_session, user.id, mailbox)
+
+    db_session.refresh(application)
+    stored = _list_gmail_messages(db_session, user.id)
+    marker = (
+        db_session.query(RecruiterMessage)
+        .filter(
+            RecruiterMessage.user_id == user.id,
+            RecruiterMessage.source == "gmail_sync",
+        )
+        .one()
+    )
+    cursor = json.loads(marker.body)
+    assert application.status == "Rejected"
+    assert [message["id"] for message in stored] == ["partial-smiths-rejection"]
+    assert cursor["rate_limit_count"] == 1
+    assert cursor["cooldown_until"]
+    assert first_error.value.status_code == 503
+
+    def unexpected_fetch(*_args, **_kwargs):
+        raise AssertionError("Gmail must not be called during the cooldown.")
+
+    monkeypatch.setattr(
+        recruiter_messages_router,
+        "_fetch_messages",
+        unexpected_fetch,
+    )
+    with pytest.raises(recruiter_messages_router.GmailRateLimitError):
+        _sync_messages_for_user(db_session, user.id, mailbox)
