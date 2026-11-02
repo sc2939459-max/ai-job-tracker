@@ -2489,22 +2489,41 @@ function RecruiterMessagesPage({ user }) {
     setError("");
     try {
       const statusResponse = await api.get("/recruiter-messages/status");
-      const messageResponse = await api.get("/recruiter-messages");
-      const applicationsResponse = await api.get("/jobs");
       const connectedNow = Boolean(statusResponse.data?.connected);
-      const incoming = Array.isArray(messageResponse.data) ? messageResponse.data : [];
-      const appList = Array.isArray(applicationsResponse.data) ? applicationsResponse.data : [];
       setConnected(connectedNow);
       setConnectedEmail(statusResponse.data?.email || "");
-      setMessages(incoming);
+
+      const [storedMessagesResponse, applicationsResponse] = await Promise.all([
+        api.get("/recruiter-messages/messages"),
+        api.get("/jobs"),
+      ]);
+      const storedMessages = Array.isArray(storedMessagesResponse.data)
+        ? storedMessagesResponse.data
+        : [];
+      const appList = Array.isArray(applicationsResponse.data) ? applicationsResponse.data : [];
+      setMessages(storedMessages);
       setApplications(appList);
-      refreshReviewState(incoming);
-      setLastSync(new Date());
-      if (incoming.some((item) => item.statusUpdated)) {
-        window.dispatchEvent(new Event("jobtracker:data-changed"));
+      refreshReviewState(storedMessages);
+
+      if (connectedNow) {
+        try {
+          const syncResponse = await api.get("/recruiter-messages");
+          const syncedMessages = Array.isArray(syncResponse.data) ? syncResponse.data : [];
+          setMessages(syncedMessages);
+          refreshReviewState(syncedMessages);
+          setLastSync(new Date());
+          if (syncedMessages.some((item) => item.statusUpdated)) {
+            window.dispatchEvent(new Event("jobtracker:data-changed"));
+          }
+        } catch (syncError) {
+          setError(
+            syncError.response?.data?.detail || "Gmail sync failed. Your saved messages are still available."
+          );
+        }
+      } else {
+        setLastSync(null);
       }
     } catch (err) {
-      setMessages([]);
       const status = err.response?.status;
       setError(status === 503
         ? (err.response?.data?.detail || "Gmail integration is not configured in the backend.")

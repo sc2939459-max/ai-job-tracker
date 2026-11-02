@@ -1,4 +1,5 @@
 import base64
+import json
 from datetime import date, datetime, timedelta, timezone
 from email.utils import format_datetime
 from types import SimpleNamespace
@@ -21,6 +22,7 @@ from app.routers.recruiter_messages import (
     _parse_message,
     _process_gmail_messages,
     _safe_status_update,
+    _sync_messages_for_user,
     review_message_match,
 )
 from app.routers import recruiter_messages as recruiter_messages_router
@@ -75,21 +77,23 @@ def _create_application(
 def _smiths_email(message_id: str = "smiths-rejection-1") -> dict:
     return {
         "id": message_id,
-        "sender": "SmartRecruiters <notifications@smartrecruiters.com>",
-        "subject": "Update on your application for Software Engineer at Smiths Detection",
+        "sender": "Abhijit Lamb from Smiths Detection <notifications@smartrecruiters.com>",
+        "subject": "Thank you for your interest in Software Engineer position at Smiths Detection",
         "message": (
-            "We have decided to move forward with another candidate for this "
-            "particular role."
+            "Dear Maddipatla,\n\nThank you very much for your interest in the "
+            "Software Engineer position at Smiths Detection. After careful "
+            "consideration, we have decided to move forward with another "
+            "candidate for this particular role.\n\nWhile we won't be "
+            "progressing with your application at this time, we believe you "
+            "could be a great fit for future opportunities. Smiths Detection "
+            "Talent Acquisition Team"
         ),
-        "receivedAt": datetime.now(timezone.utc).isoformat(),
+        "receivedAt": datetime(2026, 10, 14, 5, 10, tzinfo=timezone.utc).isoformat(),
     }
 
 
 def _smiths_gmail_message(message_id: str = "smiths-gmail-message") -> dict:
-    body = (
-        "We have decided to move forward with another candidate for this "
-        "particular role."
-    )
+    email = _smiths_email(message_id)
     return {
         "id": message_id,
         "payload": {
@@ -97,19 +101,19 @@ def _smiths_gmail_message(message_id: str = "smiths-gmail-message") -> dict:
             "headers": [
                 {
                     "name": "From",
-                    "value": "SmartRecruiters <notifications@smartrecruiters.com>",
+                    "value": email["sender"],
                 },
                 {
                     "name": "Subject",
-                    "value": "Update on your application for Software Engineer at Smiths Detection",
+                    "value": email["subject"],
                 },
                 {
                     "name": "Date",
-                    "value": format_datetime(datetime.now(timezone.utc)),
+                    "value": format_datetime(datetime.fromisoformat(email["receivedAt"])),
                 },
             ],
             "body": {
-                "data": base64.urlsafe_b64encode(body.encode()).decode(),
+                "data": base64.urlsafe_b64encode(email["message"].encode()).decode(),
             },
         },
     }
@@ -251,6 +255,7 @@ def test_application_statuses_are_classified(body, expected):
 def test_email_update_persists_rejection_and_message_in_database(db_session):
     user = _create_user(db_session)
     application = _create_application(db_session, user.id)
+    application.applied_date = date(2026, 10, 10)
     parsed_email = _parse_message(_smiths_gmail_message("smiths-db-update"))
 
     updates = _process_gmail_messages(db_session, user.id, [parsed_email])
@@ -264,17 +269,20 @@ def test_email_update_persists_rejection_and_message_in_database(db_session):
     assert stored[0]["matchedRole"] == "Software Engineer"
     assert stored[0]["detectedStatus"] == "Rejected"
     assert stored[0]["statusUpdated"] is True
-    assert stored[0]["message"] == (
-        "We have decided to move forward with another candidate for this particular role."
-    )
+    assert stored[0]["message"] == _smiths_email("smiths-db-update")["message"]
 
 
 def test_ambiguous_email_is_persisted_for_review_without_status_change(db_session):
     user = _create_user(db_session)
     software = _create_application(db_session, user.id)
+    software.applied_date = date(2026, 10, 10)
     _create_application(
-        db_session, user.id, role="Software Engineer II", status="Applied"
+        db_session, user.id, role="Software Engineer", status="Applied"
     )
+    db_session.query(JobApplication).filter(
+        JobApplication.user_id == user.id,
+        JobApplication.id != software.id,
+    ).one().applied_date = date(2026, 10, 10)
     email = _smiths_email("ambiguous-smiths")
     email["subject"] = "Application update at Smiths Detection"
 
@@ -293,6 +301,8 @@ def test_manual_review_matches_email_and_updates_owned_application(db_session):
         db_session, user.id, [_smiths_email("manual-review-message")]
     )
     application = _create_application(db_session, user.id)
+    application.applied_date = date(2026, 10, 10)
+    db_session.commit()
 
     reviewed = review_message_match(
         "manual-review-message",
@@ -311,6 +321,8 @@ def test_manual_review_matches_email_and_updates_owned_application(db_session):
 def test_duplicate_gmail_message_is_not_processed_or_stored_twice(db_session):
     user = _create_user(db_session)
     application = _create_application(db_session, user.id)
+    application.applied_date = date(2026, 10, 10)
+    db_session.commit()
     email = _smiths_email("duplicate-message")
 
     _process_gmail_messages(db_session, user.id, [email])
@@ -443,8 +455,43 @@ def test_fetch_skips_detail_requests_for_already_persisted_message(
         }
 
     monkeypatch.setattr(recruiter_messages_router, "_gmail_get", fake_gmail_get)
-    fetched = _fetch_messages(db_session, mailbox)
+    fetched, next_page_token = _fetch_messages(db_session, mailbox)
 
     assert len(fetched) == 1
+    assert next_page_token is None
     assert requested_urls.count("https://gmail.googleapis.com/gmail/v1/users/me/messages/new-message") == 1
     assert not any(url.endswith("/messages/already-seen") for url in requested_urls)
+
+
+def test_gmail_backfill_cursor_advances_without_repeating_list_pages(
+    db_session, monkeypatch
+):
+    user = _create_user(db_session)
+    mailbox = SimpleNamespace(
+        user_id=user.id,
+        updated_at=datetime.now(timezone.utc).replace(tzinfo=None)
+        - timedelta(minutes=5),
+    )
+    requested_tokens = []
+    responses = [([], "next-backfill-page"), ([], None)]
+
+    def fake_fetch(_db, _mailbox, page_token=None, after_timestamp=None):
+        requested_tokens.append((page_token, after_timestamp))
+        return responses.pop(0)
+
+    monkeypatch.setattr(recruiter_messages_router, "_fetch_messages", fake_fetch)
+    _sync_messages_for_user(db_session, user.id, mailbox, force=True)
+    _sync_messages_for_user(db_session, user.id, mailbox, force=True)
+
+    marker = (
+        db_session.query(RecruiterMessage)
+        .filter(
+            RecruiterMessage.user_id == user.id,
+            RecruiterMessage.source == "gmail_sync",
+        )
+        .one()
+    )
+    cursor = json.loads(marker.body)
+    assert requested_tokens == [(None, None), ("next-backfill-page", None)]
+    assert cursor["mode"] == "incremental"
+    assert "after" in cursor

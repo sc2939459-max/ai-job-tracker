@@ -2,6 +2,7 @@ import base64
 import binascii
 import html
 import hmac
+import json
 import logging
 import os
 import re
@@ -281,6 +282,24 @@ def _phrase_in_text(phrase: str, text: str) -> bool:
     )
 
 
+def _role_mentioned(role: str, text: str) -> bool:
+    if not _phrase_in_text(role, text):
+        return False
+    tokens = _normalize(text).split()
+    role_tokens = _normalize(role).split()
+    for index in range(len(tokens) - len(role_tokens) + 1):
+        if tokens[index:index + len(role_tokens)] != role_tokens:
+            continue
+        following = tokens[index + len(role_tokens):index + len(role_tokens) + 1]
+        if following and following[0] in {
+            "i", "ii", "iii", "iv", "senior", "junior", "staff", "lead",
+            "principal", "associate",
+        }:
+            continue
+        return True
+    return False
+
+
 def _reference_ids(item: dict[str, Any]) -> set[str]:
     text = _message_text(item)
     refs = {
@@ -335,7 +354,7 @@ def _match_application(
             return None
         role_matches = [
             app for app in applications
-            if _phrase_in_text(app.role or "", _message_text(item))
+            if _role_mentioned(app.role or "", _message_text(item))
         ]
         return role_matches[0] if len(role_matches) == 1 else None
 
@@ -344,7 +363,7 @@ def _match_application(
 
     role_matches = [
         app for app in company_matches
-        if _phrase_in_text(app.role or "", _message_text(item))
+        if _role_mentioned(app.role or "", _message_text(item))
     ]
     if len(role_matches) == 1:
         return role_matches[0]
@@ -816,49 +835,33 @@ def _gmail_get(
     return data
 
 
-def _fetch_messages(db: Session, mailbox: GoogleMailbox) -> list[dict[str, Any]]:
+def _fetch_messages(
+    db: Session,
+    mailbox: GoogleMailbox,
+    page_token: str | None = None,
+    after_timestamp: int | None = None,
+) -> tuple[list[dict[str, Any]], str | None]:
     access_token = _refresh_access_token(mailbox)
     headers = {"Authorization": f"Bearer {access_token}"}
     params: dict[str, Any] = {
-        "maxResults": 100,
+        "maxResults": 50,
         "q": (
-            'newer_than:180d {interview recruiter hiring application candidate '
-            'assessment offer "job opportunity" rejection rejected "not selected" '
-            '"not moving forward" "regret to inform" unsuccessful '
-            '"position has been filled" "another candidate"}'
+            'newer_than:180d {"another candidate" "not moving forward" '
+            '"regret to inform" "position has been filled" "application received" '
+            '"under review" shortlisted interview assessment "offer letter" '
+            '"offer of employment" "coding challenge" "technical test" '
+            '"withdrawn your application"}'
         ),
     }
-    first_sync = (
-        db.query(RecruiterMessage.id)
-        .filter(
-            RecruiterMessage.user_id == mailbox.user_id,
-            RecruiterMessage.source == "gmail_sync",
-            RecruiterMessage.external_url == GMAIL_SYNC_MARKER_URL,
-        )
-        .first()
-        is None
-    )
-    if not first_sync and mailbox.updated_at:
-        marker = mailbox.updated_at
-        if marker.tzinfo is None:
-            marker = marker.replace(tzinfo=timezone.utc)
-        params["q"] += f" after:{max(int(marker.timestamp()) - 120, 0)}"
+    if after_timestamp:
+        params["q"] += f" after:{after_timestamp}"
+    if page_token:
+        params["pageToken"] = page_token
 
-    references: list[dict[str, Any]] = []
-    page_token = None
-
-    for _ in range(3):
-        page_params = dict(params)
-        if page_token:
-            page_params["pageToken"] = page_token
-
-        page = _gmail_get(f"{GMAIL_API}/messages", headers, page_params)
-        references.extend(
-            ref for ref in page.get("messages", []) if ref.get("id")
-        )
-        page_token = page.get("nextPageToken")
-        if not page_token:
-            break
+    page = _gmail_get(f"{GMAIL_API}/messages", headers, params)
+    references = [
+        ref for ref in page.get("messages", []) if ref.get("id")
+    ]
 
     external_urls = [
         _gmail_external_url(str(ref["id"]))
@@ -904,7 +907,7 @@ def _fetch_messages(db: Session, mailbox: GoogleMailbox) -> list[dict[str, Any]]
             messages.append(item)
 
     messages.sort(key=lambda item: item.get("receivedAt") or "", reverse=True)
-    return messages
+    return messages, page.get("nextPageToken")
 
 
 def _sync_messages_for_user(
@@ -913,21 +916,18 @@ def _sync_messages_for_user(
     mailbox: GoogleMailbox,
     force: bool = False,
 ) -> dict[str, Any]:
-    has_completed_sync = (
-        db.query(RecruiterMessage.id)
+    sync_marker = (
+        db.query(RecruiterMessage)
         .filter(
             RecruiterMessage.user_id == user_id,
             RecruiterMessage.source == "gmail_sync",
             RecruiterMessage.external_url == GMAIL_SYNC_MARKER_URL,
         )
         .first()
-        is not None
     )
-    first_sync = not has_completed_sync
     now = datetime.now(timezone.utc).replace(tzinfo=None)
     if (
         not force
-        and not first_sync
         and mailbox.updated_at
         and (now - mailbox.updated_at).total_seconds() < GMAIL_SYNC_INTERVAL_SECONDS
     ):
@@ -937,20 +937,54 @@ def _sync_messages_for_user(
             "checkedAt": mailbox.updated_at.isoformat(),
         }
 
-    messages = _fetch_messages(db, mailbox)
+    try:
+        cursor = json.loads(sync_marker.body) if sync_marker and sync_marker.body else {}
+    except json.JSONDecodeError:
+        logger.warning("Resetting invalid Gmail synchronization cursor for user_id=%s", user_id)
+        cursor = {}
+
+    mode = cursor.get("mode", "backfill")
+    if mode not in {"backfill", "incremental"}:
+        mode = "backfill"
+        cursor = {}
+    after_timestamp = cursor.get("after") if mode == "incremental" else None
+    try:
+        after_timestamp = int(after_timestamp) if after_timestamp else None
+    except (TypeError, ValueError):
+        after_timestamp = None
+
+    messages, next_page_token = _fetch_messages(
+        db,
+        mailbox,
+        page_token=cursor.get("page_token"),
+        after_timestamp=after_timestamp,
+    )
     updates = _process_gmail_messages(db, user_id, messages)
     mailbox.updated_at = now
-    if first_sync:
-        db.add(
-            RecruiterMessage(
-                user_id=user_id,
-                subject="",
-                body="",
-                category="sync_state",
-                source="gmail_sync",
-                external_url=GMAIL_SYNC_MARKER_URL,
-            )
+    if next_page_token:
+        next_cursor = {
+            "mode": mode,
+            "page_token": next_page_token,
+        }
+        if after_timestamp:
+            next_cursor["after"] = after_timestamp
+    else:
+        next_cursor = {
+            "mode": "incremental",
+            "after": max(int(now.replace(tzinfo=timezone.utc).timestamp()) - 120, 0),
+        }
+    if sync_marker is None:
+        sync_marker = RecruiterMessage(
+            user_id=user_id,
+            subject="",
+            body="",
+            category="sync_state",
+            source="gmail_sync",
+            external_url=GMAIL_SYNC_MARKER_URL,
         )
+        db.add(sync_marker)
+    sync_marker.body = json.dumps(next_cursor)
+    sync_marker.updated_at = now
     try:
         db.commit()
     except Exception:
@@ -1133,6 +1167,14 @@ def list_messages(
     if not mailbox:
         return []
     return _sync_messages_for_user(db, user.id, mailbox)["messages"]
+
+
+@router.get("/messages")
+def get_stored_messages(
+    db: Session = Depends(get_db),
+    user=Depends(get_current_user),
+):
+    return _list_gmail_messages(db, user.id)
 
 
 @router.post("/sync")
