@@ -2787,7 +2787,7 @@ function RecruiterMessagesPage({ user }) {
         <div className="recruiter-automation-notice">
           <strong>Application updates detected</strong>
           {updatedMessageRecords.slice(0, 4).map((item) => (
-            <span key={`${item.id}-${item.status}`}>✓ {item.company} · {item.role} → <b>{item.status}</b></span>
+            <span key={`${item.id}-${item.detectedStatus || item.status}`}>✓ {item.company} · {item.role} → <b>{item.detectedStatus || "Updated"}</b></span>
           ))}
         </div>
       )}
@@ -2860,15 +2860,15 @@ function RecruiterMessagesPage({ user }) {
                 <div className="recruiter-message-content">
                   <div className="recruiter-message-top">
                     <div><strong>{item.matchedCompany || item.company || "Company"}</strong><span>{item.matchedRole || item.role || "Role not specified"}{item.sender ? ` · ${item.sender}` : ""}</span></div>
-                    <span className="recruiter-status">{didUpdateApplication ? "Application updated" : detectedStatus || (wasViewed ? "Read" : item.status || "New")}</span>
+                    <span className="recruiter-status">{detectedStatus || (didUpdateApplication ? "Application updated" : wasViewed ? "Read" : item.status || "New")}</span>
                   </div>
                   <h3>{item.subject || "Recruiter update"}</h3>
                   <p className={isExpanded ? "recruiter-message-full" : ""}>{item.message || item.body || "Recruiter message received."}</p>
                   <div className="recruiter-message-footer">
                     <span>{item.receivedAt ? new Date(item.receivedAt).toLocaleString("en-IN", { dateStyle: "medium", timeStyle: "short" }) : "Recently received"}</span>
+                    {detectedStatus && <b>Detected: {detectedStatus}</b>}
                     {didUpdateApplication && <b>Application status updated</b>}
                     {!didUpdateApplication && detectedStatus && item.applicationId && <b>Application not updated</b>}
-                    {!didUpdateApplication && detectedStatus && <b>Detected: {detectedStatus}</b>}
                     <span>Match: {{ needs_review: "Needs review", matched: "Matched", unmatched: "Unmatched" }[item.matchingReviewStatus] || "Unmatched"}</span>
                     {item.applicationId && <span>Application: {item.matchedRole || item.role}</span>}
                     <span className="recruiter-message-expand-hint">{isExpanded ? "Click to collapse" : "Click to read"}</span>
