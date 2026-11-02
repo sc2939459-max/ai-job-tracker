@@ -17,6 +17,7 @@ import httpx
 from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import RedirectResponse
 from jose import JWTError, jwt
+from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
 from ..database import get_db
@@ -26,11 +27,19 @@ from ..models import GoogleMailbox, JobApplication, RecruiterMessage
 router = APIRouter(prefix="/recruiter-messages", tags=["Recruiter Messages"])
 logger = logging.getLogger(__name__)
 
+
+class ManualMatchRequest(BaseModel):
+    application_id: int
+
+
 GOOGLE_AUTH_URL = "https://accounts.google.com/o/oauth2/v2/auth"
 GOOGLE_TOKEN_URL = "https://oauth2.googleapis.com/token"
 GMAIL_API = "https://gmail.googleapis.com/gmail/v1/users/me"
 GOOGLE_SCOPES = "https://www.googleapis.com/auth/gmail.readonly"
 ALGORITHM = "HS256"
+GMAIL_SYNC_INTERVAL_SECONDS = 60
+GMAIL_MESSAGE_PREFIX = "gmail:"
+GMAIL_SYNC_MARKER_URL = "gmail:sync-state"
 
 # Set SECRET_KEY in backend/.env. Do not use a development fallback in production.
 SECRET_KEY = os.getenv("SECRET_KEY")
@@ -166,28 +175,65 @@ def _normalize(value: str | None) -> str:
 
 
 def _classify_application_outcome(subject: str, body: str) -> str | None:
-    """Return Rejected only when strong rejection language is present."""
+    """Classify a clear application update without guessing from generic language."""
     text = re.sub(r"\s+", " ", f"{subject} {body}").lower()
-    patterns = (
-        r"\bwe regret to inform you\b",
-        r"\bnot moving forward with (?:your )?(?:application|candidacy)\b",
-        r"\bwill not be moving forward\b",
-        r"\bdecided to move forward with another candidate\b",
-        r"\bwe have decided not to proceed with (?:your )?(?:application|candidacy)\b",
-        r"\bhas decided not to proceed with (?:your )?(?:application|candidacy)\b",
-        r"\bhas decided not to move forward with (?:your )?(?:application|candidacy)\b",
-        r"\b(?:your )?application (?:was|has been) (?:not selected|unsuccessful|rejected)\b",
-        r"\bwe (?:will|are) not proceeding with (?:your )?(?:application|candidacy)\b",
-        r"\bwe have selected another candidate\b",
-        r"\bwe have chosen another candidate\b",
-        r"\bwe will not be proceeding with your application\b",
-        r"\bwe are unable to move forward with your application\b",
-        r"\bno longer under consideration\b",
-        r"\bposition has been filled\b",
-        r"\bwe are unable to offer you\b",
-        r"\bwe cannot offer you\b",
+    outcomes = (
+        ("Rejected", (
+            r"\bwe regret to inform you\b",
+            r"\bnot moving forward with (?:your )?(?:application|candidacy)\b",
+            r"\bwill not be moving forward\b",
+            r"\bdecided to move forward with another candidate\b",
+            r"\bmove forward with another candidate for this particular role\b",
+            r"\b(?:we|the team) (?:won't|will not) be progressing with your application\b",
+            r"\bwe have decided not to proceed with (?:your )?(?:application|candidacy)\b",
+            r"\bhas decided not to proceed with (?:your )?(?:application|candidacy)\b",
+            r"\bhas decided not to move forward with (?:your )?(?:application|candidacy)\b",
+            r"\b(?:your )?application (?:was|has been) (?:not selected|unsuccessful|rejected)\b",
+            r"\bwe (?:will|are) not proceeding with (?:your )?(?:application|candidacy)\b",
+            r"\bwe have selected another candidate\b",
+            r"\bwe have chosen another candidate\b",
+            r"\bwe will not be proceeding with your application\b",
+            r"\bwe are unable to move forward with your application\b",
+            r"\bno longer under consideration\b",
+            r"\bposition has been filled\b",
+            r"\bwe are unable to offer you\b",
+            r"\bwe cannot offer you\b",
+        )),
+        ("Withdrawn", (
+            r"\b(?:we have|you have) withdrawn your application\b",
+            r"\byour application has been withdrawn\b",
+        )),
+        ("Offer", (
+            r"\b(?:job offer|offer of employment|pleased to offer you|offer letter)\b",
+        )),
+        ("Interview", (
+            r"\b(?:invite|invitation|schedule|scheduled) (?:you )?(?:to an? )?interview\b",
+            r"\binterview (?:invitation|schedule|scheduled)\b",
+            r"\bphone screen\b",
+        )),
+        ("Assessment", (
+            r"\b(?:assessment|coding challenge|technical test) (?:is|has been|will be|to be)? ?(?:the )?(?:next step|assigned|available|sent)?\b",
+        )),
+        ("Shortlisted", (
+            r"\bshortlisted\b",
+            r"\bselected for the next round\b",
+        )),
+        ("In Review", (
+            r"\bapplication (?:is|has been|is currently) under review\b",
+            r"\bwe are reviewing your application\b",
+            r"\byour application is being reviewed\b",
+        )),
+        ("Applied", (
+            r"\bapplication (?:has been )?received\b",
+            r"\bthank you for applying\b",
+            r"\bwe received your application\b",
+            r"\byour application has been submitted\b",
+        )),
     )
-    return "Rejected" if any(re.search(pattern, text, re.I) for pattern in patterns) else None
+    for status, patterns in outcomes:
+        if any(re.search(pattern, text, re.I) for pattern in patterns):
+            return status
+    return None
 
 
 def _sender_domain(sender: str) -> str:
@@ -208,90 +254,199 @@ def _company_domain_matches(company: str, sender: str) -> bool:
         return False
     company_words = set(company_norm.split())
     domain_words = set(domain_root.split())
+    company_compact = company_norm.replace(" ", "")
+    domain_compact = domain_root.replace(" ", "")
     return (
         company_norm == domain_root
         or company_norm in domain_root
         or domain_root in company_norm
+        or company_compact == domain_compact
         or bool(company_words & domain_words)
     )
 
 
-def _company_match_score(app: JobApplication, item: dict[str, Any]) -> int:
-    company = _normalize(app.company)
-    text = _normalize(f"{item.get('subject', '')} {item.get('message', '')}")
-    score = 0
+def _message_text(item: dict[str, Any]) -> str:
+    return " ".join(
+        str(item.get(key) or "")
+        for key in ("subject", "message", "sender", "senderName", "snippet")
+    )
 
-    if _company_domain_matches(app.company or "", item.get("sender", "")):
-        score += 3
-    if company and re.search(rf"\b{re.escape(company)}\b", text):
-        score += 3
 
-    role = _normalize(app.role)
-    if role and len(role) >= 4 and re.search(rf"\b{re.escape(role)}\b", text):
-        score += 4
-    return score
+def _phrase_in_text(phrase: str, text: str) -> bool:
+    normalized_phrase = _normalize(phrase)
+    normalized_text = _normalize(text)
+    return bool(
+        normalized_phrase
+        and f" {normalized_phrase} " in f" {normalized_text} "
+    )
+
+
+def _reference_ids(item: dict[str, Any]) -> set[str]:
+    text = _message_text(item)
+    refs = {
+        re.sub(r"[^a-z0-9]", "", str(item.get("jobReferenceId") or "").lower())
+    }
+    pattern = (
+        r"\b(?:job|application|requisition|reference|candidate)"
+        r"\s*(?:id|number|no\.?|#)\s*[:#-]?\s*([a-z0-9][a-z0-9-]{3,})"
+    )
+    refs.update(
+        re.sub(r"[^a-z0-9]", "", match.lower())
+        for match in re.findall(pattern, text, re.I)
+    )
+    return {ref for ref in refs if ref}
 
 
 def _has_company_evidence(app: JobApplication, item: dict[str, Any]) -> bool:
-    company = _normalize(app.company)
-    text = _normalize(f"{item.get('subject', '')} {item.get('message', '')}")
     return _company_domain_matches(
         app.company or "", item.get("sender", "")
-    ) or bool(company and re.search(rf"\b{re.escape(company)}\b", text))
+    ) or _phrase_in_text(app.company or "", _message_text(item))
 
 
 def _match_application(
     item: dict[str, Any],
     applications: list[JobApplication],
 ) -> JobApplication | None:
-    """Match only a single high-confidence application; leave ambiguous mail untouched."""
-    if not _classify_application_outcome(
-        item.get("subject", ""), item.get("message", "")
-    ):
+    """Match by explicit reference or unique company/role evidence; never guess."""
+    if not applications:
         return None
 
-    ranked = sorted(
-        ((_company_match_score(app, item), app) for app in applications),
-        key=lambda pair: pair[0],
-        reverse=True,
-    )
-    if not ranked or ranked[0][0] < 3:
-        return None
-
-    best_score, best = ranked[0]
-    if not _has_company_evidence(best, item):
-        return None
-    if len(ranked) > 1 and ranked[0][0] == ranked[1][0]:
-        return None
-
-    same_company = [
+    reference_matches = [
         app for app in applications
-        if _company_match_score(app, item) >= 3
+        if re.sub(
+            r"[^a-z0-9]",
+            "",
+            str(getattr(app, "external_application_id", "") or "").lower(),
+        ) in _reference_ids(item)
+        and getattr(app, "external_application_id", None)
     ]
-    if len(same_company) > 1:
-        role = _normalize(best.role)
-        message_text = _normalize(
-            f"{item.get('subject', '')} {item.get('message', '')}"
-        )
-        if not role or not re.search(rf"\b{re.escape(role)}\b", message_text):
+    if len(reference_matches) == 1:
+        return reference_matches[0]
+    if len(reference_matches) > 1:
+        return None
+
+    company_matches = [
+        app for app in applications if _has_company_evidence(app, item)
+    ]
+    if not company_matches:
+        if not _classify_application_outcome(
+            item.get("subject", ""), item.get("message", "")
+        ):
             return None
+        role_matches = [
+            app for app in applications
+            if _phrase_in_text(app.role or "", _message_text(item))
+        ]
+        return role_matches[0] if len(role_matches) == 1 else None
 
-    return best if best_score >= 3 else None
+    if len(company_matches) == 1:
+        return company_matches[0]
+
+    role_matches = [
+        app for app in company_matches
+        if _phrase_in_text(app.role or "", _message_text(item))
+    ]
+    if len(role_matches) == 1:
+        return role_matches[0]
+    return None
 
 
-def _received_date(item: dict[str, Any]):
+def _received_datetime(item: dict[str, Any]) -> datetime | None:
     received_at = item.get("receivedAt")
     if not received_at:
         return None
     try:
-        return datetime.fromisoformat(
-            received_at.replace("Z", "+00:00")
-        ).date()
+        parsed = datetime.fromisoformat(str(received_at).replace("Z", "+00:00"))
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return parsed.astimezone(timezone.utc)
     except (TypeError, ValueError):
         return None
 
 
-def _apply_rejection_updates(
+STATUS_RANK = {
+    "Wishlist": 0,
+    "Applying": 0,
+    "Applied": 1,
+    "Application Received": 1,
+    "In Review": 2,
+    "Under Review": 2,
+    "Screening": 2,
+    "Shortlisted": 3,
+    "Assessment": 4,
+    "Interview Scheduled": 5,
+    "Interview": 5,
+    "Offer Received": 6,
+    "Selected": 6,
+    "Offer": 6,
+    "Rejected": 7,
+    "Withdrawn": 7,
+}
+
+
+def _safe_status_update(app: JobApplication, item: dict[str, Any], status: str) -> bool:
+    current = (app.status or "Applied").strip()
+    if current in {"Rejected", "Offer", "Offer Received", "Selected", "Withdrawn"}:
+        return False
+    if status == current or STATUS_RANK.get(status, 0) < STATUS_RANK.get(current, 0):
+        return False
+
+    received_at = _received_datetime(item)
+    applied_date = getattr(app, "applied_date", None)
+    if received_at and applied_date and received_at.date() < applied_date:
+        return False
+
+    updated_at = getattr(app, "updated_at", None)
+    if (
+        status == "Rejected"
+        and STATUS_RANK.get(current, 0) >= STATUS_RANK["Shortlisted"]
+        and received_at
+        and updated_at
+    ):
+        updated_utc = updated_at.replace(tzinfo=timezone.utc) if updated_at.tzinfo is None else updated_at.astimezone(timezone.utc)
+        if received_at < updated_utc:
+            return False
+
+    app.status = status
+    return True
+
+
+def _gmail_external_url(message_id: str) -> str:
+    return f"{GMAIL_MESSAGE_PREFIX}{message_id}"
+
+
+def _serialize_gmail_message(record: RecruiterMessage) -> dict[str, Any]:
+    matched = record.job_id is not None
+    needs_review = record.category == "needs_review"
+    return {
+        "id": (record.external_url or "").removeprefix(GMAIL_MESSAGE_PREFIX),
+        "company": record.company or "Company",
+        "matchedCompany": record.company if matched else None,
+        "role": record.role or "Role not specified",
+        "matchedRole": record.role if matched else None,
+        "applicationId": record.job_id,
+        "sender": (
+            f"{record.sender_name} <{record.sender_email}>"
+            if record.sender_name and record.sender_email
+            else record.sender_email or record.sender_name or ""
+        ),
+        "subject": record.subject,
+        "message": record.body,
+        "receivedAt": record.received_at.isoformat() if record.received_at else None,
+        "detectedStatus": record.application_status,
+        "statusUpdated": record.category == "updated",
+        "matchingReviewStatus": "needs_review" if needs_review else ("matched" if matched else "unmatched"),
+        "matchReviewRequired": needs_review,
+        "matchReviewReason": (
+            "No unique application match was found."
+            if needs_review
+            else None
+        ),
+        "status": "New",
+    }
+
+
+def _process_gmail_messages(
     db: Session,
     user_id: int,
     messages: list[dict[str, Any]],
@@ -301,51 +456,89 @@ def _apply_rejection_updates(
         .filter(JobApplication.user_id == user_id)
         .all()
     )
-    updates: list[dict[str, Any]] = []
+    message_urls = [
+        _gmail_external_url(str(item["id"]))
+        for item in messages
+        if item.get("id")
+    ]
+    existing = (
+        db.query(RecruiterMessage)
+        .filter(
+            RecruiterMessage.user_id == user_id,
+            RecruiterMessage.source == "gmail",
+            RecruiterMessage.external_url.in_(message_urls),
+        )
+        .all()
+        if message_urls
+        else []
+    )
+    existing_by_url = {record.external_url: record for record in existing}
+    updates_by_message: dict[str, dict[str, Any]] = {}
+    status_messages_seen: set[int] = set()
     changed = False
 
-    for item in messages:
-        if not item.get("id"):
+    ordered_messages = sorted(
+        (item for item in messages if item.get("id")),
+        key=lambda item: _received_datetime(item) or datetime.min.replace(tzinfo=timezone.utc),
+        reverse=True,
+    )
+    for item in ordered_messages:
+        external_url = _gmail_external_url(str(item["id"]))
+        if external_url in existing_by_url:
             continue
+
         outcome = _classify_application_outcome(
             item.get("subject", ""), item.get("message", "")
         )
-        if outcome != "Rejected":
-            continue
-
         app = _match_application(item, applications)
-        if app is None:
-            item["matchReviewRequired"] = True
-            continue
+        category = "needs_review"
+        if app:
+            item["applicationId"] = app.id
+            item["matchedRole"] = app.role
+            item["matchedCompany"] = app.company
+            category = "matched"
 
-        item["applicationId"] = app.id
-        item["matchedRole"] = app.role
-        item["matchedCompany"] = app.company
-        item["detectedStatus"] = "Rejected"
+        item["detectedStatus"] = outcome
         item["statusUpdated"] = False
+        item["matchReviewRequired"] = not app
+        item["matchingReviewStatus"] = "matched" if app else "needs_review"
 
-        current = (app.status or "Applied").strip()
-        if current in {"Rejected", "Offer", "Withdrawn"}:
-            item["statusUpdated"] = current == "Rejected"
-            continue
+        if app and outcome:
+            if app.id not in status_messages_seen:
+                status_messages_seen.add(app.id)
+                if _safe_status_update(app, item, outcome):
+                    category = "updated"
+                    item["statusUpdated"] = True
+                    updates_by_message[str(item["id"])] = {
+                        "messageId": item["id"],
+                        "applicationId": app.id,
+                        "company": app.company,
+                        "role": app.role,
+                        "status": outcome,
+                        "source": "gmail",
+                    }
+            else:
+                category = "matched"
 
-        received_date = _received_date(item)
-        applied_date = getattr(app, "applied_date", None)
-        if received_date and applied_date and received_date < applied_date:
-            item["matchReviewRequired"] = True
-            continue
-
-        app.status = "Rejected"
-        item["statusUpdated"] = True
-        item["statusSource"] = "gmail_rejection_email"
-        updates.append({
-            "messageId": item["id"],
-            "applicationId": app.id,
-            "company": app.company,
-            "role": app.role,
-            "status": "Rejected",
-            "source": "gmail_rejection_email",
-        })
+        sender_name, sender_email = parseaddr(item.get("sender", ""))
+        received_at = _received_datetime(item)
+        record = RecruiterMessage(
+            user_id=user_id,
+            job_id=app.id if app else None,
+            company=app.company if app else item.get("company"),
+            role=app.role if app else item.get("role"),
+            sender_name=sender_name or None,
+            sender_email=sender_email or None,
+            subject=(item.get("subject") or "Recruiter update")[:250],
+            body=item.get("message", ""),
+            category=category,
+            application_status=outcome,
+            source="gmail",
+            external_url=external_url,
+            received_at=received_at.replace(tzinfo=None) if received_at else None,
+        )
+        db.add(record)
+        existing_by_url[external_url] = record
         changed = True
 
     if changed:
@@ -353,12 +546,12 @@ def _apply_rejection_updates(
             db.commit()
         except Exception:
             db.rollback()
-            logger.exception("Failed to commit Gmail rejection status updates")
+            logger.exception("Failed to save Gmail messages and application updates")
             raise HTTPException(
                 status_code=500,
-                detail="Could not update application statuses from Gmail.",
+                detail="Could not save Gmail messages or application statuses.",
             )
-    return updates
+    return list(updates_by_message.values())
 
 
 def _company_from_sender(sender: str) -> str:
@@ -404,7 +597,7 @@ def _parse_message(message: dict[str, Any]) -> dict[str, Any]:
         "role": role,
         "sender": sender,
         "subject": subject,
-        "message": body[:4000],
+        "message": body,
         "receivedAt": received,
         "status": "New",
     }
@@ -455,7 +648,7 @@ def _gmail_get(
     params: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Make a Gmail API request and handle provider errors safely."""
-    
+
     response = None
 
     for attempt in range(4):
@@ -479,34 +672,42 @@ def _gmail_get(
                 detail="Could not connect to Gmail. Please try again later.",
             )
 
-        if response.status_code != 403:
-            break
-
+        reasons: set[str] = set()
         try:
             payload = response.json()
             error = payload.get("error", {})
             errors = error.get("errors", []) if isinstance(error, dict) else []
-            reasons = [
+            reasons = {
                 str(item["reason"])
                 for item in errors
                 if isinstance(item, dict) and item.get("reason")
-            ]
+            }
         except (ValueError, AttributeError, TypeError):
-            reasons = []
+            pass
 
-        rate_limit_reasons = {
-            "rateLimitExceeded",
-            "userRateLimitExceeded",
-        }
-
-        if not rate_limit_reasons.intersection(reasons):
+        quota_403 = response.status_code == 403 and bool(
+            reasons.intersection({"rateLimitExceeded", "userRateLimitExceeded"})
+        )
+        if response.status_code != 429 and not quota_403:
             break
 
         if attempt == 3:
             logger.warning("Gmail API rate limit retries exhausted.")
             break
 
-        delay = (2 ** attempt) + random.uniform(0, 0.5)
+        retry_after = response.headers.get("Retry-After")
+        try:
+            delay = min(max(float(retry_after), 0), 30) if retry_after else 2**attempt
+        except ValueError:
+            try:
+                retry_time = parsedate_to_datetime(retry_after)
+                delay = min(
+                    max((retry_time - datetime.now(timezone.utc)).total_seconds(), 0),
+                    30,
+                )
+            except (TypeError, ValueError, OverflowError):
+                delay = 2**attempt
+        delay += random.uniform(0, 0.5)
         logger.warning(
             "Gmail API rate limited; retrying in %.2f seconds (attempt %s/4).",
             delay,
@@ -528,20 +729,24 @@ def _gmail_get(
         )
 
     if response.status_code == 403:
-        reasons = []
+        reasons: set[str] = set()
         try:
             payload = response.json()
             error = payload.get("error", {})
             if isinstance(error, dict):
-                reasons = [
+                reasons = {
                     str(item["reason"])
                     for item in error.get("errors", [])
                     if isinstance(item, dict) and item.get("reason")
-                ]
+                }
                 if not reasons and error.get("status"):
-                    reasons = [str(error["status"])]
+                    reasons = {str(error["status"])}
         except (ValueError, AttributeError, TypeError):
             pass
+
+        rate_limited = bool(
+            reasons.intersection({"rateLimitExceeded", "userRateLimitExceeded"})
+        )
 
         endpoint = (
             "message detail" if "/messages/" in url else "message list"
@@ -549,51 +754,16 @@ def _gmail_get(
         logger.warning(
             "Gmail API returned 403 for %s; reasons=%s",
             endpoint,
-            reasons or ["not provided"],
+            sorted(reasons) or ["not provided"],
         )
+
         raise HTTPException(
-            status_code=503 if {
-                "rateLimitExceeded",
-                "userRateLimitExceeded",
-            }.intersection(reasons) else 403,
+            status_code=503 if rate_limited else 403,
             detail=(
                 "Gmail rate limit reached. Please wait and try again."
-                if {
-                    "rateLimitExceeded",
-                    "userRateLimitExceeded",
-                }.intersection(reasons)
+                if rate_limited
                 else "Gmail denied access to this request."
             ),
-        )
-
-
-    if response.status_code == 403:
-        reasons: list[str] = []
-        try:
-            payload = response.json()
-            error = payload.get("error", {})
-            if isinstance(error, dict):
-                reasons = [
-                    str(item["reason"])
-                    for item in error.get("errors", [])
-                    if isinstance(item, dict) and item.get("reason")
-                ]
-                if not reasons and error.get("status"):
-                    reasons = [str(error["status"])]
-        except (ValueError, AttributeError, TypeError):
-            pass
-
-        endpoint = (
-            "message detail" if "/messages/" in url else "message list"
-        )
-        logger.warning(
-            "Gmail API returned 403 for %s; reasons=%s",
-            endpoint,
-            reasons or ["not provided"],
-        )
-        raise HTTPException(
-            status_code=403,
-            detail="Gmail denied access to this request.",
         )
 
     if response.status_code == 404:
@@ -646,64 +816,92 @@ def _gmail_get(
     return data
 
 
-def _fetch_messages(mailbox: GoogleMailbox) -> list[dict[str, Any]]:
+def _fetch_messages(db: Session, mailbox: GoogleMailbox) -> list[dict[str, Any]]:
     access_token = _refresh_access_token(mailbox)
     headers = {"Authorization": f"Bearer {access_token}"}
     params: dict[str, Any] = {
-        "maxResults": 25,
+        "maxResults": 100,
         "q": (
             'newer_than:180d {interview recruiter hiring application candidate '
             'assessment offer "job opportunity" rejection rejected "not selected" '
             '"not moving forward" "regret to inform" unsuccessful '
-            '"position has been filled"}'
+            '"position has been filled" "another candidate"}'
         ),
     }
+    first_sync = (
+        db.query(RecruiterMessage.id)
+        .filter(
+            RecruiterMessage.user_id == mailbox.user_id,
+            RecruiterMessage.source == "gmail_sync",
+            RecruiterMessage.external_url == GMAIL_SYNC_MARKER_URL,
+        )
+        .first()
+        is None
+    )
+    if not first_sync and mailbox.updated_at:
+        marker = mailbox.updated_at
+        if marker.tzinfo is None:
+            marker = marker.replace(tzinfo=timezone.utc)
+        params["q"] += f" after:{max(int(marker.timestamp()) - 120, 0)}"
 
-    messages: list[dict[str, Any]] = []
+    references: list[dict[str, Any]] = []
     page_token = None
 
-    # Cap work at 300 messages per sync to limit request duration.
     for _ in range(3):
         page_params = dict(params)
         if page_token:
             page_params["pageToken"] = page_token
 
         page = _gmail_get(f"{GMAIL_API}/messages", headers, page_params)
-        for ref in page.get("messages", []):
-            message_id = ref.get("id")
-            if not message_id:
-                continue
-            try:
-                detail = _gmail_get(
-                    f"{GMAIL_API}/messages/{message_id}",
-                    headers,
-                    {"format": "full"},
-                )
-            except HTTPException as exc:
-                if exc.status_code == 404:
-                    logger.info("Skipping Gmail message that no longer exists")
-                    continue
-
-                if exc.status_code == 403:
-                    logger.warning(
-                        "Skipping a Gmail message because Google denied access."
-                    )
-                    continue
-
-                raise
-
-            item = _parse_message(detail)
-            if _is_recruiter_message(
-                item["subject"], item["sender"], item["message"]
-            ):
-                item["detectedStatus"] = _classify_application_outcome(
-                    item["subject"], item["message"]
-                )
-                messages.append(item)
-
+        references.extend(
+            ref for ref in page.get("messages", []) if ref.get("id")
+        )
         page_token = page.get("nextPageToken")
         if not page_token:
             break
+
+    external_urls = [
+        _gmail_external_url(str(ref["id"]))
+        for ref in references
+    ]
+    existing_urls = (
+        {
+            row[0]
+            for row in db.query(RecruiterMessage.external_url)
+            .filter(
+                RecruiterMessage.user_id == mailbox.user_id,
+                RecruiterMessage.source == "gmail",
+                RecruiterMessage.external_url.in_(external_urls),
+            )
+            .all()
+        }
+        if external_urls
+        else set()
+    )
+
+    messages: list[dict[str, Any]] = []
+    for ref in references:
+        message_id = str(ref["id"])
+        if _gmail_external_url(message_id) in existing_urls:
+            continue
+        try:
+            detail = _gmail_get(
+                f"{GMAIL_API}/messages/{message_id}",
+                headers,
+                {"format": "full"},
+            )
+        except HTTPException as exc:
+            if exc.status_code == 404:
+                logger.info("Skipping Gmail message that no longer exists")
+                continue
+            raise
+
+        item = _parse_message(detail)
+        if _is_recruiter_message(item["subject"], item["sender"], item["message"]):
+            item["detectedStatus"] = _classify_application_outcome(
+                item["subject"], item["message"]
+            )
+            messages.append(item)
 
     messages.sort(key=lambda item: item.get("receivedAt") or "", reverse=True)
     return messages
@@ -713,14 +911,72 @@ def _sync_messages_for_user(
     db: Session,
     user_id: int,
     mailbox: GoogleMailbox,
+    force: bool = False,
 ) -> dict[str, Any]:
-    messages = _fetch_messages(mailbox)
-    updates = _apply_rejection_updates(db, user_id, messages)
+    has_completed_sync = (
+        db.query(RecruiterMessage.id)
+        .filter(
+            RecruiterMessage.user_id == user_id,
+            RecruiterMessage.source == "gmail_sync",
+            RecruiterMessage.external_url == GMAIL_SYNC_MARKER_URL,
+        )
+        .first()
+        is not None
+    )
+    first_sync = not has_completed_sync
+    now = datetime.now(timezone.utc).replace(tzinfo=None)
+    if (
+        not force
+        and not first_sync
+        and mailbox.updated_at
+        and (now - mailbox.updated_at).total_seconds() < GMAIL_SYNC_INTERVAL_SECONDS
+    ):
+        return {
+            "messages": _list_gmail_messages(db, user_id),
+            "applicationUpdates": [],
+            "checkedAt": mailbox.updated_at.isoformat(),
+        }
+
+    messages = _fetch_messages(db, mailbox)
+    updates = _process_gmail_messages(db, user_id, messages)
+    mailbox.updated_at = now
+    if first_sync:
+        db.add(
+            RecruiterMessage(
+                user_id=user_id,
+                subject="",
+                body="",
+                category="sync_state",
+                source="gmail_sync",
+                external_url=GMAIL_SYNC_MARKER_URL,
+            )
+        )
+    try:
+        db.commit()
+    except Exception:
+        db.rollback()
+        logger.exception("Failed to save Gmail synchronization timestamp")
+        raise HTTPException(status_code=500, detail="Could not save Gmail sync state.")
+
     return {
-        "messages": messages,
+        "messages": _list_gmail_messages(db, user_id),
         "applicationUpdates": updates,
         "checkedAt": datetime.now(timezone.utc).isoformat(),
     }
+
+
+def _list_gmail_messages(db: Session, user_id: int) -> list[dict[str, Any]]:
+    records = (
+        db.query(RecruiterMessage)
+        .filter(
+            RecruiterMessage.user_id == user_id,
+            RecruiterMessage.source == "gmail",
+        )
+        .order_by(RecruiterMessage.received_at.desc(), RecruiterMessage.id.desc())
+        .limit(200)
+        .all()
+    )
+    return [_serialize_gmail_message(record) for record in records]
 
 
 @router.get("/status")
@@ -894,7 +1150,71 @@ def sync_messages(
             status_code=409,
             detail="Gmail is not connected. Connect Gmail first.",
         )
-    return _sync_messages_for_user(db, user.id, mailbox)["messages"]
+    return _sync_messages_for_user(db, user.id, mailbox, force=True)["messages"]
+
+
+@router.put("/{message_id}/review")
+def review_message_match(
+    message_id: str,
+    data: ManualMatchRequest,
+    db: Session = Depends(get_db),
+    user=Depends(get_current_user),
+):
+    message = (
+        db.query(RecruiterMessage)
+        .filter(
+            RecruiterMessage.user_id == user.id,
+            RecruiterMessage.source == "gmail",
+            RecruiterMessage.external_url == _gmail_external_url(message_id),
+        )
+        .first()
+    )
+    if not message:
+        raise HTTPException(status_code=404, detail="Gmail message not found.")
+    if message.job_id is not None:
+        raise HTTPException(
+            status_code=409,
+            detail="This Gmail message is already matched to an application.",
+        )
+
+    application = (
+        db.query(JobApplication)
+        .filter(
+            JobApplication.id == data.application_id,
+            JobApplication.user_id == user.id,
+        )
+        .first()
+    )
+    if not application:
+        raise HTTPException(status_code=404, detail="Application not found.")
+
+    message.job_id = application.id
+    message.company = application.company
+    message.role = application.role
+    message.category = "matched"
+
+    if message.application_status:
+        item = {
+            "receivedAt": (
+                message.received_at.replace(tzinfo=timezone.utc).isoformat()
+                if message.received_at
+                else None
+            )
+        }
+        if _safe_status_update(application, item, message.application_status):
+            message.category = "updated"
+
+    try:
+        db.commit()
+        db.refresh(message)
+    except Exception:
+        db.rollback()
+        logger.exception("Failed to save manual Gmail message match")
+        raise HTTPException(
+            status_code=500,
+            detail="Could not save the reviewed Gmail match.",
+        )
+    return _serialize_gmail_message(message)
 
 
 @router.get("/cron-sync", include_in_schema=False)

@@ -33,6 +33,7 @@ const statuses = [
   "Applying",
   "Applied",
   "Application Received",
+  "In Review",
   "Under Review",
   "Shortlisted",
   "Interview Scheduled",
@@ -2446,6 +2447,7 @@ function RecruiterMessagesPage({ user }) {
   const [messageFilter, setMessageFilter] = useState("all");
   const [applicationFilter, setApplicationFilter] = useState(null);
   const [expandedMessageId, setExpandedMessageId] = useState(null);
+  const [reviewSelections, setReviewSelections] = useState({});
 
   useEffect(() => {
     setViewedMessageIds([]);
@@ -2465,139 +2467,42 @@ function RecruiterMessagesPage({ user }) {
     .replace(/[^a-z0-9]+/g, " ")
     .trim();
 
-  const statusRank = {
-    Wishlist: 0,
-    Applying: 1,
-    Applied: 2,
-    Screening: 3,
-    Interview: 4,
-    Offer: 5,
-    Rejected: 5,
-    Withdrawn: 5,
-  };
+  const classifyEmail = (item) => item.detectedStatus || null;
 
-  const classifyEmail = (item) => {
-    const text = normalize(`${item.subject || ""} ${item.message || item.body || ""}`);
-    if (!text) return null;
-
-    // Strong signals only. Check terminal outcomes before generic review language.
-    // A message such as "Thank you for applying; we will review your application"
-    // is still an application confirmation, not a Screening event.
-    if (/(offer letter|job offer|pleased to offer|congratulations.*offer|offer of employment)/i.test(text)) return "Offer";
-    if (/(not moving forward|not selected|regret to inform|application.*rejected|no longer.*consideration|position.*filled|we have decided not to proceed|will not be moving forward)/i.test(text)) return "Rejected";
-    if (/(interview invitation|invite.*interview|schedule.*interview|interview.*schedule|technical interview|phone screen|screening call|assessment.*next step)/i.test(text)) return "Interview";
-    if (/(application.*received|received.*application|thank you for applying|thanks for applying|application.*submitted|successfully applied|we received your application|your application has been received)/i.test(text)) return "Applied";
-    if (/(your application is under review|your application is being reviewed|we are reviewing your application|application has moved to.*review|shortlisted|selected for the next round|moved forward)/i.test(text)) return "Screening";
-    return null;
-  };
-
-  const findApplication = (item, list) => {
-    const company = normalize(item.company);
-    const role = normalize(item.role);
-    if (!company) return null;
-
-    const companyCandidates = list.filter((app) => {
-      const appCompany = normalize(app.company);
-      return appCompany &&
-        (appCompany === company ||
-          appCompany.includes(company) ||
-          company.includes(appCompany));
-    });
-
-    if (companyCandidates.length === 1) return companyCandidates[0];
-    if (!role || role === normalize("Role not specified")) return null;
-
-    const roleCandidates = companyCandidates.filter((app) => {
-      const appRole = normalize(app.role);
-      return appRole &&
-        (appRole === role || appRole.includes(role) || role.includes(appRole));
-    });
-
-    return roleCandidates.length === 1 ? roleCandidates[0] : null;
-  };
-
-  const filterTrackedMessages = (incoming, appList) => {
-    if (!Array.isArray(incoming) || !incoming.length) return [];
-    return incoming.filter((item) => !!findApplication(item, appList));
-  };
-
-  const applyEmailStatusUpdates = async (incoming, appList) => {
-    const changed = [];
-    const failures = [];
-    for (const item of incoming) {
-      const nextStatus = classifyEmail(item);
-      if (!nextStatus) continue;
-
-      const app = findApplication(item, appList);
-      if (!app) continue;
-
-      const current = String(app.status || "Applied");
-      const currentRank = statusRank[current] ?? 0;
-      const nextRank = statusRank[nextStatus] ?? 0;
-
-      // Do not move a terminal/manual status backwards. Rejected and Offer remain terminal.
-      if (["Offer", "Rejected", "Withdrawn"].includes(current)) continue;
-      if (nextStatus === current) continue;
-      if (nextStatus !== "Rejected" && nextRank < currentRank) continue;
-
-      try {
-        await api.put(`/jobs/${app.id}`, { status: nextStatus });
-        changed.push({
-          id: item.id,
-          applicationId: app.id,
-          company: app.company,
-          role: app.role,
-          status: nextStatus,
-          subject: item.subject || "Recruiter update",
-        });
-        app.status = nextStatus;
-      } catch (err) {
-        failures.push(
-          `${app.company || "Application"} · ${app.role || "Role"}: ${
-            err.response?.data?.detail || "status update failed"
-          }`
-        );
-      }
-    }
-    if (changed.length) {
-      setApplications([...appList]);
-      setUpdatedMessages((previous) => {
-        const byMessageId = new Map(previous.map((item) => [item.id, item]));
-        changed.forEach((item) => byMessageId.set(item.id, item));
-        const next = [...byMessageId.values()];
-        localStorage.setItem(updatedMessagesKey, JSON.stringify(next));
-        return next;
-      });
-      window.dispatchEvent(new Event("jobtracker:data-changed"));
-    }
-    if (failures.length) {
-      setError(
-        `Could not apply ${failures.length} detected status update${
-          failures.length === 1 ? "" : "s"
-        }: ${failures.slice(0, 3).join("; ")}`
-      );
-    }
+  const refreshReviewState = (incoming) => {
+    const updated = incoming
+      .filter((item) => item.statusUpdated)
+      .map((item) => ({
+        id: item.id,
+        applicationId: item.applicationId,
+        company: item.matchedCompany || item.company,
+        role: item.matchedRole || item.role,
+        status: item.detectedStatus,
+        subject: item.subject,
+      }));
+    setUpdatedMessages(updated);
+    localStorage.setItem(updatedMessagesKey, JSON.stringify(updated));
   };
 
   const loadMessages = async () => {
     setLoading(true);
     setError("");
     try {
-      const [statusResponse, messageResponse, applicationsResponse] = await Promise.all([
-        api.get("/recruiter-messages/status"),
-        api.get("/recruiter-messages"),
-        api.get("/jobs"),
-      ]);
+      const statusResponse = await api.get("/recruiter-messages/status");
+      const messageResponse = await api.get("/recruiter-messages");
+      const applicationsResponse = await api.get("/jobs");
       const connectedNow = Boolean(statusResponse.data?.connected);
       const incoming = Array.isArray(messageResponse.data) ? messageResponse.data : [];
       const appList = Array.isArray(applicationsResponse.data) ? applicationsResponse.data : [];
-      const trackedIncoming = filterTrackedMessages(incoming, appList);
       setConnected(connectedNow);
       setConnectedEmail(statusResponse.data?.email || "");
-      setMessages(trackedIncoming);
+      setMessages(incoming);
       setApplications(appList);
+      refreshReviewState(incoming);
       setLastSync(new Date());
-      if (connectedNow) await applyEmailStatusUpdates(trackedIncoming, appList);
+      if (incoming.some((item) => item.statusUpdated)) {
+        window.dispatchEvent(new Event("jobtracker:data-changed"));
+      }
     } catch (err) {
       setMessages([]);
       const status = err.response?.status;
@@ -2626,21 +2531,56 @@ function RecruiterMessagesPage({ user }) {
     setSyncing(true);
     setError("");
     try {
-      const [response, applicationsResponse] = await Promise.all([
-        api.post("/recruiter-messages/sync"),
-        api.get("/jobs"),
-      ]);
+      const response = await api.post("/recruiter-messages/sync");
+      const applicationsResponse = await api.get("/jobs");
       const incoming = Array.isArray(response.data) ? response.data : [];
       const appList = Array.isArray(applicationsResponse.data) ? applicationsResponse.data : [];
-      const trackedIncoming = filterTrackedMessages(incoming, appList);
-      setMessages(trackedIncoming);
+      setMessages(incoming);
       setApplications(appList);
-      await applyEmailStatusUpdates(trackedIncoming, appList);
+      refreshReviewState(incoming);
       setLastSync(new Date());
+      if (incoming.some((item) => item.statusUpdated)) {
+        window.dispatchEvent(new Event("jobtracker:data-changed"));
+      }
     } catch (err) {
       setError(err.response?.data?.detail || "Unable to sync recruiter messages.");
     } finally {
       setSyncing(false);
+    }
+  };
+
+  const reviewMessageMatch = async (item) => {
+    const applicationId = Number(reviewSelections[item.id]);
+    if (!applicationId) return;
+
+    setError("");
+    try {
+      const response = await api.put(
+        `/recruiter-messages/${encodeURIComponent(item.id)}/review`,
+        { application_id: applicationId }
+      );
+      const applicationsResponse = await api.get("/jobs");
+      const appList = Array.isArray(applicationsResponse.data)
+        ? applicationsResponse.data
+        : [];
+      setMessages((previous) =>
+        previous.map((message) =>
+          message.id === item.id ? response.data : message
+        )
+      );
+      setApplications(appList);
+      if (response.data.statusUpdated) {
+        window.dispatchEvent(new Event("jobtracker:data-changed"));
+      }
+      refreshReviewState(
+        messages.map((message) =>
+          message.id === item.id ? response.data : message
+        )
+      );
+    } catch (err) {
+      setError(
+        err.response?.data?.detail || "Unable to save the reviewed email match."
+      );
     }
   };
 
@@ -2662,6 +2602,7 @@ function RecruiterMessagesPage({ user }) {
   const submittedStatuses = new Set([
     "applied",
     "application received",
+    "in review",
     "under review",
     "shortlisted",
     "interview scheduled",
@@ -2688,9 +2629,7 @@ function RecruiterMessagesPage({ user }) {
   const offersReceivedCount = applicationStatuses.filter((status) =>
     ["selected", "offer received", "offer"].includes(status)
   ).length;
-  const updatedMessageRecords = updatedMessages.filter((record) =>
-    messages.some((message) => message.id === record.id)
-  );
+  const updatedMessageRecords = messages.filter((message) => message.statusUpdated);
   const statusUpdateCount = updatedMessageRecords.length;
   const applicationFilterStatuses = {
     appliedJobs: new Set([
@@ -2707,7 +2646,7 @@ function RecruiterMessagesPage({ user }) {
       "offer",
       "rejected",
     ]),
-    awaitingResponse: new Set(["applied", "application received", "under review"]),
+    awaitingResponse: new Set(["applied", "application received", "in review", "under review"]),
     interviewStage: new Set(["interview scheduled", "interview"]),
     offersReceived: new Set(["selected", "offer received", "offer"]),
   };
@@ -2839,7 +2778,7 @@ function RecruiterMessagesPage({ user }) {
             const detectedStatus = classifyEmail(item);
             const isExpanded = expandedMessageId === item.id;
             const wasViewed = viewedMessageIds.includes(item.id);
-            const didUpdateApplication = updatedMessageRecords.some((record) => record.id === item.id);
+            const didUpdateApplication = Boolean(item.statusUpdated);
             return (
               <article
                 className={`recruiter-message-card ${isExpanded ? "expanded" : ""}`}
@@ -2847,9 +2786,14 @@ function RecruiterMessagesPage({ user }) {
                 role="button"
                 tabIndex={0}
                 aria-expanded={isExpanded}
-                onClick={() => toggleMessage(item)}
+                onClick={(event) => {
+                  if (!event.target.closest("button, select")) toggleMessage(item);
+                }}
                 onKeyDown={(event) => {
-                  if (event.key === "Enter" || event.key === " ") {
+                  if (
+                    event.target === event.currentTarget &&
+                    (event.key === "Enter" || event.key === " ")
+                  ) {
                     event.preventDefault();
                     toggleMessage(item);
                   }
@@ -2858,7 +2802,7 @@ function RecruiterMessagesPage({ user }) {
                 <div className="recruiter-message-icon">✉</div>
                 <div className="recruiter-message-content">
                   <div className="recruiter-message-top">
-                    <div><strong>{item.company || "Company"}</strong><span>{item.role || "Role not specified"}{item.sender ? ` · ${item.sender}` : ""}</span></div>
+                    <div><strong>{item.matchedCompany || item.company || "Company"}</strong><span>{item.matchedRole || item.role || "Role not specified"}{item.sender ? ` · ${item.sender}` : ""}</span></div>
                     <span className="recruiter-status">{didUpdateApplication ? "Application updated" : detectedStatus || (wasViewed ? "Read" : item.status || "New")}</span>
                   </div>
                   <h3>{item.subject || "Recruiter update"}</h3>
@@ -2866,9 +2810,44 @@ function RecruiterMessagesPage({ user }) {
                   <div className="recruiter-message-footer">
                     <span>{item.receivedAt ? new Date(item.receivedAt).toLocaleString("en-IN", { dateStyle: "medium", timeStyle: "short" }) : "Recently received"}</span>
                     {didUpdateApplication && <b>Application status updated</b>}
+                    {!didUpdateApplication && detectedStatus && item.applicationId && <b>Application not updated</b>}
                     {!didUpdateApplication && detectedStatus && <b>Detected: {detectedStatus}</b>}
+                    <span>Match: {{ needs_review: "Needs review", matched: "Matched", unmatched: "Unmatched" }[item.matchingReviewStatus] || "Unmatched"}</span>
+                    {item.applicationId && <span>Application: {item.matchedRole || item.role}</span>}
                     <span className="recruiter-message-expand-hint">{isExpanded ? "Click to collapse" : "Click to read"}</span>
                   </div>
+                  {item.matchReviewRequired && (
+                    <div className="recruiter-message-review" onClick={(event) => event.stopPropagation()}>
+                      <label>
+                        Review match
+                        <select
+                          value={reviewSelections[item.id] || ""}
+                          onChange={(event) =>
+                            setReviewSelections((previous) => ({
+                              ...previous,
+                              [item.id]: event.target.value,
+                            }))
+                          }
+                        >
+                          <option value="">Select an application</option>
+                          {applications.map((application) => (
+                            <option key={application.id} value={application.id}>
+                              {application.company} · {application.role}
+                            </option>
+                          ))}
+                        </select>
+                      </label>
+                      <button
+                        type="button"
+                        className="action-blue-button"
+                        disabled={!reviewSelections[item.id]}
+                        onClick={() => reviewMessageMatch(item)}
+                      >
+                        Confirm match
+                      </button>
+                      <span>{item.matchReviewReason || "This email was not matched automatically."}</span>
+                    </div>
+                  )}
                 </div>
               </article>
             );

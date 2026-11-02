@@ -20,6 +20,7 @@ STATUSES = [
     "Applying",
     "Applied",
     "Application Received",
+    "In Review",
     "Under Review",
     "Shortlisted",
     "Interview Scheduled",
@@ -35,6 +36,7 @@ STATUSES = [
 
 STATUS_ALIASES = {
     "application received": "Application Received",
+    "in review": "In Review",
     "under review": "Under Review",
     "shortlisted": "Shortlisted",
     "interview scheduled": "Interview Scheduled",

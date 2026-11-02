@@ -33,8 +33,12 @@ The current implementation stores the Gmail refresh token so the backend can syn
 
 Start the FastAPI backend and Vite frontend as usual. Open **Recruiter Messages → Connect Gmail**, complete Google consent, and return to the Recruiter Messages page.
 
-The backend searches recent Gmail messages for job-related signals such as interview, recruiter, hiring, application, assessment, candidate, offer, and job opportunity. It then reads the message headers/body and displays matching messages in the tracker.
+The backend searches recent Gmail messages for job-related signals such as interview, recruiter, hiring, application, assessment, candidate, offer, and job opportunity. It stores processed Gmail message IDs and message content so repeated syncs can avoid fetching the same message details again. Message matching uses company and role text, sender information, and explicitly labeled job/application reference IDs. SmartRecruiters and other ATS senders are not treated as the hiring company by default.
+
+Clear detected outcomes update the matching user's application: Applied, In Review, Shortlisted, Assessment, Interview, Offer, Rejected, or Withdrawn. The backend is the source of truth for classification and status transitions. An email that does not uniquely match an application is retained in Recruiter Messages for manual review and does not change application status. Older or lower-stage updates are not allowed to roll back an advanced application status.
+
+Manual sync is available from Recruiter Messages or through `POST /api/recruiter-messages/sync`. Opening Recruiter Messages checks for new mail, with a short server-side cooldown. To run scheduled synchronization, set a strong `CRON_SECRET` in the backend environment and configure an external scheduler to call `GET /api/recruiter-messages/cron-sync` with the authorization header expected by the endpoint. Keep that secret private.
 
 ## 4. Important limitation
 
-The tracker does not claim that every email is a recruiter message. Filtering is keyword-based and can produce false positives or miss unusual recruiter emails. The Gmail permission is read-only.
+The tracker does not claim that every email is a recruiter message. Filtering is keyword-based and can produce false positives or miss unusual recruiter emails. Company/role matching is intentionally conservative: ambiguous messages require manual review rather than automatically changing an application. The Gmail permission is read-only. Verify live synchronization only after configuring Google OAuth, a reachable backend/database, and a connected Gmail mailbox.
