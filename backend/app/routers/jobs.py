@@ -1,4 +1,5 @@
 from datetime import date
+from datetime import datetime, time
 
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
@@ -7,8 +8,14 @@ from sqlalchemy.orm import Session
 
 from ..database import get_db
 from ..deps import get_current_user
-from ..models import JobApplication, Notification
+from ..models import (
+    ApplicationStatusHistory,
+    JobApplication,
+    Notification,
+    RecruiterMessage,
+)
 from ..schemas import JobCreate, JobOut
+from ..services.application_status import record_status_change
 
 router = APIRouter(
     prefix="/jobs",
@@ -131,6 +138,7 @@ class JobUpdate(BaseModel):
     notes: str | None = None
     required_skills: list | None = None
     resume_version_id: int | None = None
+    status_reason: str | None = None
 
 
 @router.get("", response_model=list[JobOut])
@@ -214,6 +222,13 @@ def create_or_update_job(
             if value is not None:
                 setattr(existing, field, value)
         existing.status = requested_status
+        record_status_change(
+            db,
+            existing,
+            previous_status,
+            "manual",
+            "Status changed in the application tracker.",
+        )
         db.commit()
         create_status_notification(db, user, existing, previous_status)
         db.commit()
@@ -225,6 +240,13 @@ def create_or_update_job(
     db.add(job)
     db.commit()
     db.refresh(job)
+    record_status_change(
+        db,
+        job,
+        None,
+        "manual",
+        "Application added to the tracker.",
+    )
     create_status_notification(db, user, job, None)
     db.commit()
     return job
@@ -243,6 +265,7 @@ def update_job(
 
     updates = data.model_dump(exclude_unset=True)
     previous_status = job.status
+    status_reason = updates.pop("status_reason", None)
 
     if "status" in updates:
         normalized_status = normalize_status(updates["status"])
@@ -253,6 +276,14 @@ def update_job(
     for field, value in updates.items():
         setattr(job, field, value)
 
+    if "status" in updates:
+        record_status_change(
+            db,
+            job,
+            previous_status,
+            "manual",
+            status_reason or "Status changed in the application tracker.",
+        )
     db.commit()
     create_status_notification(db, user, job, previous_status)
     db.commit()
@@ -273,3 +304,114 @@ def delete_job(
     db.delete(job)
     db.commit()
     return {"message": "Application deleted", "job_id": job_id}
+
+
+@router.get("/{job_id}/timeline")
+def application_timeline(
+    job_id: int,
+    db: Session = Depends(get_db),
+    user=Depends(get_current_user),
+):
+    job = (
+        db.query(JobApplication)
+        .filter(JobApplication.id == job_id, JobApplication.user_id == user.id)
+        .first()
+    )
+    if not job:
+        raise HTTPException(status_code=404, detail="Application not found")
+
+    history = (
+        db.query(ApplicationStatusHistory)
+        .filter(
+            ApplicationStatusHistory.job_id == job_id,
+            ApplicationStatusHistory.user_id == user.id,
+        )
+        .order_by(ApplicationStatusHistory.created_at.asc(), ApplicationStatusHistory.id.asc())
+        .all()
+    )
+    email_records = (
+        db.query(RecruiterMessage)
+        .filter(
+            RecruiterMessage.user_id == user.id,
+            RecruiterMessage.job_id == job_id,
+            RecruiterMessage.source == "gmail",
+        )
+        .order_by(RecruiterMessage.received_at.desc(), RecruiterMessage.id.desc())
+        .all()
+    )
+    if not history:
+        status_email = next(
+            (
+                item
+                for item in email_records
+                if item.category == "updated"
+                and item.application_status == job.status
+            ),
+            None,
+        )
+        history_items = [{
+            "id": None,
+            "previousStatus": None,
+            "status": job.status,
+            "source": "gmail" if status_email else "application",
+            "sourceEmailId": (
+                status_email.external_url.removeprefix("gmail:")
+                if status_email and status_email.external_url
+                else None
+            ),
+            "reason": (
+                f"Status update detected from recruiter email: {status_email.subject}"
+                if status_email
+                else "Current application status; prior history is not available."
+            ),
+            "timestamp": (
+                status_email.received_at
+                if status_email
+                else (
+                    datetime.combine(job.applied_date, time.min)
+                    if job.applied_date
+                    else job.created_at
+                )
+            ),
+        }]
+    else:
+        history_items = [
+            {
+                "id": item.id,
+                "previousStatus": item.previous_status,
+                "status": item.new_status,
+                "source": item.source,
+                "sourceEmailId": item.source_email_id,
+                "reason": item.reason,
+                "timestamp": item.created_at,
+            }
+            for item in history
+        ]
+
+    emails = [
+        {
+            "id": item.external_url.removeprefix("gmail:") if item.external_url else str(item.id),
+            "company": item.company,
+            "role": item.role,
+            "sender": (
+                f"{item.sender_name} <{item.sender_email}>"
+                if item.sender_name and item.sender_email
+                else item.sender_email or item.sender_name or ""
+            ),
+            "subject": item.subject,
+            "message": item.body,
+            "receivedAt": item.received_at,
+            "detectedStatus": item.application_status,
+            "statusUpdated": item.category == "updated",
+            "matchingConfidence": None,
+            "matchingReviewStatus": "matched",
+        }
+        for item in email_records
+    ]
+
+    return {
+        "applicationId": job.id,
+        "currentStatus": job.status,
+        "history": history_items,
+        "emails": emails,
+    }

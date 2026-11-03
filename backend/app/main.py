@@ -20,6 +20,7 @@ from .routers import (
     job_market,
     recruiter_messages,
     notifications,
+    reminders,
 )
 
 from .routers.company_sync import router as company_router
@@ -117,6 +118,11 @@ app.include_router(
 
 app.include_router(
     notifications.router,
+    prefix="/api",
+)
+
+app.include_router(
+    reminders.router,
     prefix="/api",
 )
 
