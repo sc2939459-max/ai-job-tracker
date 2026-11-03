@@ -8348,7 +8348,7 @@ textarea:focus-visible {
 
 .recruiter-message-summary {
   display: grid !important;
-  grid-template-columns: repeat(4, minmax(0,1fr));
+  grid-template-columns: repeat(3, minmax(0,1fr));
   gap: 0 !important;
   margin: 0 !important;
   padding: 0 !important;
@@ -8366,7 +8366,7 @@ textarea:focus-visible {
   border-right: 1px solid #e9eef5;
 }
 
-.recruiter-message-summary > :nth-child(n+5) {
+.recruiter-message-summary > :nth-child(n+4) {
   border-top: 1px solid #e9eef5;
 }
 

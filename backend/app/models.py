@@ -9,6 +9,8 @@ from sqlalchemy import (
     ForeignKey,
     JSON,
     Float,
+    Boolean,
+    Index,
 )
 from sqlalchemy.orm import (
     Mapped,
@@ -74,6 +76,25 @@ class User(Base):
 
     notifications = relationship(
         "Notification",
+        back_populates="user",
+        cascade="all, delete-orphan",
+    )
+
+    application_status_history = relationship(
+        "ApplicationStatusHistory",
+        back_populates="user",
+        cascade="all, delete-orphan",
+    )
+
+    follow_up_settings = relationship(
+        "FollowUpSettings",
+        back_populates="user",
+        cascade="all, delete-orphan",
+        uselist=False,
+    )
+
+    follow_up_reminders = relationship(
+        "FollowUpReminder",
         back_populates="user",
         cascade="all, delete-orphan",
     )
@@ -293,6 +314,19 @@ class JobApplication(Base):
 
     notifications = relationship(
         "Notification",
+        back_populates="job",
+        cascade="all, delete-orphan",
+    )
+
+    status_history = relationship(
+        "ApplicationStatusHistory",
+        back_populates="job",
+        cascade="all, delete-orphan",
+        order_by="ApplicationStatusHistory.created_at",
+    )
+
+    follow_up_reminders = relationship(
+        "FollowUpReminder",
         back_populates="job",
         cascade="all, delete-orphan",
     )
@@ -863,3 +897,76 @@ class Notification(Base):
         "RecruiterMessage",
         back_populates="notifications",
     )
+
+
+class ApplicationStatusHistory(Base):
+    __tablename__ = "application_status_history"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    user_id: Mapped[int] = mapped_column(
+        ForeignKey("users.id", ondelete="CASCADE"),
+        index=True,
+    )
+    job_id: Mapped[int] = mapped_column(
+        ForeignKey("job_applications.id", ondelete="CASCADE"),
+        index=True,
+    )
+    previous_status: Mapped[str | None] = mapped_column(String(40), nullable=True)
+    new_status: Mapped[str] = mapped_column(String(40))
+    source: Mapped[str] = mapped_column(String(40), default="manual")
+    source_email_id: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    reason: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+    user = relationship("User", back_populates="application_status_history")
+    job = relationship("JobApplication", back_populates="status_history")
+
+
+class FollowUpSettings(Base):
+    __tablename__ = "follow_up_settings"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    user_id: Mapped[int] = mapped_column(
+        ForeignKey("users.id", ondelete="CASCADE"),
+        unique=True,
+        index=True,
+    )
+    interval_days: Mapped[int] = mapped_column(Integer, default=7)
+    enabled: Mapped[bool] = mapped_column(Boolean, default=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime,
+        default=datetime.utcnow,
+        onupdate=datetime.utcnow,
+    )
+
+    user = relationship("User", back_populates="follow_up_settings")
+
+
+class FollowUpReminder(Base):
+    __tablename__ = "follow_up_reminders"
+    __table_args__ = (
+        Index("ix_follow_up_reminders_user_status_due", "user_id", "status", "due_at"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    user_id: Mapped[int] = mapped_column(
+        ForeignKey("users.id", ondelete="CASCADE"),
+        index=True,
+    )
+    job_id: Mapped[int] = mapped_column(
+        ForeignKey("job_applications.id", ondelete="CASCADE"),
+        index=True,
+    )
+    due_at: Mapped[datetime] = mapped_column(DateTime, index=True)
+    status: Mapped[str] = mapped_column(String(20), default="pending", index=True)
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime,
+        default=datetime.utcnow,
+        onupdate=datetime.utcnow,
+    )
+
+    user = relationship("User", back_populates="follow_up_reminders")
+    job = relationship("JobApplication", back_populates="follow_up_reminders")

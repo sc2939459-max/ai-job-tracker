@@ -22,6 +22,7 @@ from sqlalchemy.orm import Session
 from ..database import get_db
 from ..deps import get_current_user
 from ..models import GoogleMailbox, JobApplication, RecruiterMessage
+from ..services.application_status import record_status_change
 
 router = APIRouter(prefix="/recruiter-messages", tags=["Recruiter Messages"])
 logger = logging.getLogger(__name__)
@@ -262,8 +263,38 @@ GENERIC_EMAIL_DOMAINS = {
     "icloud", "protonmail",
 }
 
+ATS_EMAIL_DOMAINS = {
+    "ashbyhq.com",
+    "bamboohr.com",
+    "brassring.com",
+    "breezy.hr",
+    "comeet.com",
+    "greenhouse.io",
+    "greenhouse-mail.io",
+    "icims.com",
+    "jobvite.com",
+    "lever.co",
+    "myworkdayjobs.com",
+    "recruitee.com",
+    "smartrecruiters.com",
+    "successfactors.com",
+    "taleo.net",
+    "workable.com",
+    "workday.com",
+}
+
+
+def _is_ats_sender(sender: str) -> bool:
+    domain = _sender_domain(sender)
+    return any(
+        domain == ats_domain or domain.endswith(f".{ats_domain}")
+        for ats_domain in ATS_EMAIL_DOMAINS
+    )
+
 
 def _company_domain_matches(company: str, sender: str) -> bool:
+    if _is_ats_sender(sender):
+        return False
     company_norm = _normalize(company)
     domain_root = _normalize(_sender_domain(sender).split(".")[0])
     if not company_norm or not domain_root or domain_root in GENERIC_EMAIL_DOMAINS:
@@ -335,6 +366,63 @@ def _has_company_evidence(app: JobApplication, item: dict[str, Any]) -> bool:
     return _company_domain_matches(
         app.company or "", item.get("sender", "")
     ) or _phrase_in_text(app.company or "", _message_text(item))
+
+
+def _company_from_application_records(
+    text: str,
+    applications: list[JobApplication],
+) -> str | None:
+    matches = {
+        _normalize(app.company): app.company
+        for app in applications
+        if app.company and _phrase_in_text(app.company, text)
+    }
+    return next(iter(matches.values())) if len(matches) == 1 else None
+
+
+def _company_from_reference(
+    item: dict[str, Any],
+    applications: list[JobApplication],
+) -> str | None:
+    references = _reference_ids(item)
+    matches = {
+        _normalize(app.company): app.company
+        for app in applications
+        if app.company
+        and getattr(app, "external_application_id", None)
+        and re.sub(
+            r"[^a-z0-9]",
+            "",
+            str(app.external_application_id).lower(),
+        ) in references
+    }
+    return next(iter(matches.values())) if len(matches) == 1 else None
+
+
+def _company_from_text(text: str) -> str | None:
+    """Extract employer names only from explicit company/organization phrasing."""
+    patterns = (
+        r"(?im)^\s*(?:hiring\s+)?(?:company|employer|organization)\s*[:\-]\s*"
+        r"([^\r\n|;,]+)",
+        r"\b(?:at|with)\s+([A-Z][A-Za-z0-9&.,'’ -]*?)"
+        r"(?=\s+(?:for|regarding|about|position|role|application|job|opening|"
+        r"is|has|was|will|would|offers|offered)\b"
+        r"|[\[\]()\.,!?;:]|$)",
+    )
+    excluded = {
+        "our company",
+        "the company",
+        "this time",
+        "the moment",
+        "your convenience",
+    }
+    for pattern in patterns:
+        for match in re.finditer(pattern, text):
+            candidate = match.group(1).strip(" .,:;-\n\t")
+            normalized = _normalize(candidate)
+            if normalized and normalized not in excluded:
+                return candidate
+    return None
 
 
 def _match_application(
@@ -541,7 +629,17 @@ def _process_gmail_messages(
         if app and outcome:
             if app.id not in status_messages_seen:
                 status_messages_seen.add(app.id)
+                previous_status = app.status
                 if _safe_status_update(app, item, outcome):
+                    record_status_change(
+                        db,
+                        app,
+                        previous_status,
+                        "gmail",
+                        f"Detected {outcome} from recruiter email: "
+                        f"{item.get('subject') or 'Recruiter update'}",
+                        source_email_id=str(item["id"]),
+                    )
                     category = "updated"
                     item["statusUpdated"] = True
                     updates_by_message[str(item["id"])] = {
@@ -600,7 +698,33 @@ def _company_from_sender(sender: str) -> str:
     return domain.replace("-", " ").title() or "Company"
 
 
-def _parse_message(message: dict[str, Any]) -> dict[str, Any]:
+def _extract_company(
+    subject: str,
+    body: str,
+    sender: str,
+    applications: list[JobApplication] | None = None,
+) -> str:
+    item = {"subject": subject, "message": body}
+    applications = applications or []
+    for text in (subject, body):
+        known_company = _company_from_application_records(text, applications)
+        if known_company:
+            return known_company
+        company = _company_from_text(text)
+        if company:
+            return company
+
+    known_company = _company_from_reference(item, applications)
+    if known_company:
+        return known_company
+
+    return "Company" if _is_ats_sender(sender) else _company_from_sender(sender)
+
+
+def _parse_message(
+    message: dict[str, Any],
+    applications: list[JobApplication] | None = None,
+) -> dict[str, Any]:
     payload = message.get("payload") or {}
     headers = payload.get("headers") or []
     subject = _header(headers, "Subject") or "Recruiter update"
@@ -631,7 +755,7 @@ def _parse_message(message: dict[str, Any]) -> dict[str, Any]:
     return {
         "id": message.get("id"),
         "threadId": message.get("threadId"),
-        "company": _company_from_sender(sender),
+        "company": _extract_company(subject, body, sender, applications),
         "role": role,
         "sender": sender,
         "subject": subject,
@@ -830,6 +954,11 @@ def _fetch_messages(
 ) -> tuple[list[dict[str, Any]], str | None]:
     access_token = _refresh_access_token(mailbox)
     headers = {"Authorization": f"Bearer {access_token}"}
+    applications = (
+        db.query(JobApplication)
+        .filter(JobApplication.user_id == mailbox.user_id)
+        .all()
+    )
     params: dict[str, Any] = {
         "maxResults": GMAIL_SYNC_PAGE_SIZE,
         "q": (
@@ -889,7 +1018,7 @@ def _fetch_messages(
                 continue
             raise
 
-        item = _parse_message(detail)
+        item = _parse_message(detail, applications)
         if _is_recruiter_message(item["subject"], item["sender"], item["message"]):
             item["detectedStatus"] = _classify_application_outcome(
                 item["subject"], item["message"]
@@ -1312,6 +1441,7 @@ def review_message_match(
     message.category = "matched"
 
     if message.application_status:
+        previous_status = application.status
         item = {
             "receivedAt": (
                 message.received_at.replace(tzinfo=timezone.utc).isoformat()
@@ -1320,6 +1450,14 @@ def review_message_match(
             )
         }
         if _safe_status_update(application, item, message.application_status):
+            record_status_change(
+                db,
+                application,
+                previous_status,
+                "gmail_review",
+                f"Status update reviewed from recruiter email: {message.subject}",
+                source_email_id=message_id,
+            )
             message.category = "updated"
 
     try:
@@ -1333,7 +1471,7 @@ def review_message_match(
             detail="Could not save the reviewed Gmail match.",
         )
     return _serialize_gmail_message(message)
-
+4
 
 @router.get("/cron-sync", include_in_schema=False)
 def cron_sync_all_mailboxes(

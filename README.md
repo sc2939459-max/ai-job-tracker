@@ -168,6 +168,22 @@ interview rounds and eventually to an offer or other outcome.
 
 ------------------------------------------------------------------------
 
+### 🧭 Application Timeline & Follow-up Reminders
+
+Each application detail page shows its status journey, recorded status
+changes, matched Gmail messages, and linked interview rounds. Manual
+status changes ask for confirmation and can include a reason; the timeline
+does not invent dates for stages without a recorded event.
+
+Follow-up reminders can be enabled or disabled per account and configured
+for an interval of 1–90 days. Pending reminders can be rescheduled or
+completed, and terminal outcomes such as offers, rejections, and
+withdrawals are excluded. Vercel runs the reminder schedule daily; set
+`CRON_SECRET` in the deployment environment so the scheduled endpoint is
+authorized.
+
+------------------------------------------------------------------------
+
 ### 📧 Recruiter Messages & Gmail Integration
 
 The project includes recruiter-message integration designed to connect

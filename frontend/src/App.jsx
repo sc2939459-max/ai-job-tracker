@@ -2232,33 +2232,105 @@ function SavedJobsPage({ user, onNavigate }) {
 function ApplicationProcessPage({ jobId, onNavigate, returnPage = "applications" }) {
   const [job, setJob] = useState(null);
   const [interviews, setInterviews] = useState([]);
+  const [statusHistory, setStatusHistory] = useState([]);
+  const [applicationEmails, setApplicationEmails] = useState([]);
+  const [reminders, setReminders] = useState([]);
+  const [followUpSettings, setFollowUpSettings] = useState({ intervalDays: 7, enabled: true });
+  const [statusDraft, setStatusDraft] = useState("");
+  const [statusReason, setStatusReason] = useState("");
+  const [rescheduleValue, setRescheduleValue] = useState("");
+  const [actionError, setActionError] = useState("");
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
 
-  useEffect(() => {
+  const loadApplication = async () => {
     if (!jobId) return;
-    Promise.all([api.get("/jobs"), api.get("/interviews")])
-      .then(([jobResponse, interviewResponse]) => {
-        const foundJob = (Array.isArray(jobResponse.data) ? jobResponse.data : []).find((item) => String(item.id) === String(jobId));
-        setJob(foundJob || null);
-        setInterviews((Array.isArray(interviewResponse.data) ? interviewResponse.data : []).filter((item) => String(item.job_id) === String(jobId)));
-      })
-      .catch((err) => setError(err.response?.data?.detail || "Unable to load this application."))
-      .finally(() => setLoading(false));
+    setLoading(true);
+    setError("");
+    try {
+      const [jobResponse, interviewResponse, timelineResponse, reminderResponse] = await Promise.all([
+        api.get("/jobs"),
+        api.get("/interviews"),
+        api.get(`/jobs/${jobId}/timeline`),
+        api.get("/reminders"),
+      ]);
+      const foundJob = (Array.isArray(jobResponse.data) ? jobResponse.data : []).find((item) => String(item.id) === String(jobId));
+      setJob(foundJob || null);
+      setStatusDraft(foundJob?.status || "Applied");
+      setInterviews((Array.isArray(interviewResponse.data) ? interviewResponse.data : []).filter((item) => String(item.job_id) === String(jobId)));
+      setStatusHistory(Array.isArray(timelineResponse.data?.history) ? timelineResponse.data.history : []);
+      setApplicationEmails(Array.isArray(timelineResponse.data?.emails) ? timelineResponse.data.emails : []);
+      setReminders((Array.isArray(reminderResponse.data?.reminders) ? reminderResponse.data.reminders : []).filter((item) => String(item.applicationId) === String(jobId)));
+      setFollowUpSettings(reminderResponse.data?.settings || { intervalDays: 7, enabled: true });
+    } catch (err) {
+      setError(err.response?.data?.detail || "Unable to load this application.");
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  useEffect(() => {
+    loadApplication();
   }, [jobId]);
 
   const stages = [
-    ["Applied", "Application submitted or manually tracked."],
-    ["Application Received", "Confirmation from the company or ATS."],
-    ["Recruiter Review", "Recruiter/ATS review. Confirm only when you have evidence."],
-    ["Shortlisted", "Employer moves you forward."],
-    ["Online Exam", "Assessment, coding test or screening task."],
-    ["Interview Rounds", "TL → HR → Manager → Client → Final, depending on the company."],
-    ["Offer Letter", "Offer issued by the employer."],
-    ["Joining / Joined", "Final onboarding and joining stage."],
+    { title: "Applied", detail: "Application submitted or manually tracked.", statuses: ["applied"] },
+    { title: "Application Received", detail: "Confirmation from the company or ATS.", statuses: ["application received"] },
+    { title: "In Review", detail: "The employer is reviewing the application.", statuses: ["in review", "under review", "screening"] },
+    { title: "Shortlisted", detail: "The employer moves the application forward.", statuses: ["shortlisted"] },
+    { title: "Assessment", detail: "An assessment or technical test is requested.", statuses: ["assessment"] },
+    { title: "Interview", detail: "An interview is scheduled or underway.", statuses: ["interview", "interview scheduled"] },
+    { title: "Offer", detail: "An offer has been received or the candidate selected.", statuses: ["offer", "offer received", "selected"] },
+    { title: "Rejected", detail: "The employer has declined the application.", statuses: ["rejected"] },
+    { title: "Withdrawn", detail: "The application was withdrawn.", statuses: ["withdrawn"] },
   ];
   const status = String(job?.status || "Applied");
-  const statusIndex = status === "Applied" ? 0 : status === "Screening" ? 2 : status === "Interview" ? 5 : status === "Offer" ? 6 : status === "Rejected" ? -1 : 0;
+  const normalizedStatus = status.trim().toLowerCase();
+  const statusIndex = stages.findIndex((stage) => stage.statuses.includes(normalizedStatus));
+  const isTerminalStatus = ["offer", "offer received", "selected", "rejected", "withdrawn"].includes(normalizedStatus);
+  const progress = statusIndex < 0 ? 0 : isTerminalStatus ? 100 : Math.round(((statusIndex + 1) / 6) * 100);
+
+  const saveStatus = async () => {
+    if (!job || statusDraft === status) return;
+    if (!window.confirm(`Change ${job.company} · ${job.role} from ${status} to ${statusDraft}?`)) return;
+    setActionError("");
+    try {
+      await api.put(`/jobs/${job.id}`, {
+        status: statusDraft,
+        status_reason: statusReason.trim() || "Manually updated by the applicant.",
+      });
+      window.dispatchEvent(new Event("jobtracker:data-changed"));
+      setStatusReason("");
+      await loadApplication();
+    } catch (err) {
+      setActionError(err.response?.data?.detail || "Unable to update application status.");
+    }
+  };
+
+  const saveFollowUpSettings = async (event) => {
+    event.preventDefault();
+    setActionError("");
+    try {
+      const response = await api.put("/reminders/settings", {
+        interval_days: Number(followUpSettings.intervalDays),
+        enabled: followUpSettings.enabled,
+      });
+      setFollowUpSettings(response.data);
+      await loadApplication();
+    } catch (err) {
+      setActionError(err.response?.data?.detail || "Unable to save follow-up settings.");
+    }
+  };
+
+  const updateReminder = async (reminderId, payload) => {
+    setActionError("");
+    try {
+      await api.patch(`/reminders/${reminderId}`, payload);
+      await loadApplication();
+    } catch (err) {
+      setActionError(err.response?.data?.detail || "Unable to update reminder.");
+    }
+  };
 
   if (loading) return <div className="loading">Loading application journey…</div>;
   if (error || !job) return <section className="panel"><div className="page-error">{error || "Application not found."}</div><button className="secondary" onClick={() => onNavigate(returnPage)}>← Back to applications</button></section>;
@@ -2283,7 +2355,7 @@ function ApplicationProcessPage({ jobId, onNavigate, returnPage = "applications"
       <div className="process-page-meta">
         <span><small>Applied on</small><strong>{job.applied_date || "Date not recorded"}</strong></span>
         <span><small>Current stage</small><strong>{status}</strong></span>
-        <span><small>Journey progress</small><strong>{statusIndex < 0 ? "Closed" : `${Math.round(((statusIndex + 1) / stages.length) * 100)}%`}</strong></span>
+        <span><small>Journey progress</small><strong>{progress}%</strong></span>
       </div>
     </section>
 
@@ -2294,10 +2366,83 @@ function ApplicationProcessPage({ jobId, onNavigate, returnPage = "applications"
           <h2>Application journey</h2>
           <p>Track each confirmed step from submission through joining.</p>
         </div>
-        <span className="application-process-stage-count">{statusIndex < 0 ? "Application closed" : `Stage ${statusIndex + 1} of ${stages.length}`}</span>
+        <span className="application-process-stage-count">{statusIndex < 0 ? "Status not mapped" : `${status} · ${progress}%`}</span>
       </div>
-      <div className="application-process-page-timeline">{stages.map(([title, detail], index) => { const done = statusIndex >= index; const current = statusIndex === index; return <div className={`process-page-stage ${done ? "done" : ""} ${current ? "current" : ""}`} key={title}><div className="process-page-marker">{done ? "✓" : index + 1}</div><div className="process-page-stage-copy"><strong>{title}</strong>{current && <span className="process-current-label">CURRENT STAGE</span>}<p>{detail}</p></div></div>; })}</div>
-      <div className="process-evidence-box"><span className="process-evidence-icon" aria-hidden="true">i</span><div><strong>Keep your timeline accurate</strong><p>Only record a new stage after a real email, recruiter message, assessment, interview, offer or joining update.</p></div></div>
+      <div className="application-process-page-timeline">{stages.map((stage, index) => {
+        const event = [...statusHistory].reverse().find((item) => stage.statuses.includes(String(item.status || "").toLowerCase()));
+        const current = stage.statuses.includes(normalizedStatus);
+        const branch = index >= 6;
+        const done = branch ? current : current || (statusIndex > index && index < 6);
+        const fallbackTimestamp = index === 0 ? job.applied_date : null;
+        return <div className={`process-page-stage ${done ? "done" : ""} ${current ? "current" : ""}`} key={stage.title}>
+          <div className="process-page-marker">{done ? "✓" : index + 1}</div>
+          <div className="process-page-stage-copy">
+            <strong>{stage.title}</strong>
+            {current && <span className="process-current-label">CURRENT STAGE</span>}
+            <p>{stage.detail}</p>
+            <small className="timeline-event-meta">
+              {event?.timestamp ? new Date(event.timestamp).toLocaleString("en-IN", { dateStyle: "medium", timeStyle: "short" }) : fallbackTimestamp || "No timestamp recorded"}
+              {" · "}{event?.source ? `Source: ${event.source}` : index === 0 ? "Source: application record" : "No recorded event"}
+              {event?.reason ? ` · ${event.reason}` : ""}
+            </small>
+          </div>
+        </div>;
+      })}</div>
+      <div className="manual-status-controls">
+        <label>Status
+          <select value={statusDraft} onChange={(event) => setStatusDraft(event.target.value)}>
+            {statuses.filter((item) => item !== "Wishlist" && item !== "Applying").map((item) => <option key={item}>{item}</option>)}
+          </select>
+        </label>
+        <label>Reason (optional)
+          <input value={statusReason} onChange={(event) => setStatusReason(event.target.value)} placeholder="Why are you updating the status?" />
+        </label>
+        <button type="button" className="action-blue-button" disabled={statusDraft === status} onClick={saveStatus}>Update status</button>
+      </div>
+      {actionError && <div className="page-error">{actionError}</div>}
+      <div className="process-evidence-box"><span className="process-evidence-icon" aria-hidden="true">i</span><div><strong>Verified history only</strong><p>Timestamp and source are shown when recorded. Earlier stages are not assigned invented dates.</p></div></div>
+    </section>
+
+    <section className="panel application-process-page-card application-email-history">
+      <div className="application-process-section-heading">
+        <div><div className="eyebrow">EMAIL HISTORY</div><h2>Recruiter messages</h2><p>Gmail messages matched to this application.</p></div>
+        <span className="application-process-stage-count">{applicationEmails.length} email{applicationEmails.length === 1 ? "" : "s"}</span>
+      </div>
+      {applicationEmails.length ? <div className="application-email-list">{applicationEmails.map((email) => (
+        <article className="application-email-card" key={email.id}>
+          <div className="application-email-heading">
+            <strong>{email.subject || "Recruiter update"}</strong>
+            <span>{email.detectedStatus || "No status detected"}</span>
+          </div>
+          <small>{email.sender || "Sender not available"} · {email.receivedAt ? new Date(email.receivedAt).toLocaleString("en-IN", { dateStyle: "medium", timeStyle: "short" }) : "Date not recorded"}</small>
+          <p>{email.statusUpdated ? "This email updated the application status." : "This email did not change the application status."}</p>
+          <small>Match: {email.matchingReviewStatus || "matched"} · Confidence not available</small>
+          <details><summary>Open original email</summary><pre>{email.message || "Email content is unavailable."}</pre></details>
+        </article>
+      ))}</div> : <div className="empty"><strong>No matched emails yet.</strong><span>Unmatched messages remain available for review in Recruiter Messages.</span></div>}
+    </section>
+
+    <section className="panel application-process-page-card application-reminders">
+      <div className="application-process-section-heading">
+        <div><div className="eyebrow">FOLLOW-UP REMINDERS</div><h2>Stay in touch</h2><p>Reminders are generated for applications without a recent update.</p></div>
+      </div>
+      <form className="follow-up-settings" onSubmit={saveFollowUpSettings}>
+        <label>Remind me after
+          <input type="number" min="1" max="90" value={followUpSettings.intervalDays} onChange={(event) => setFollowUpSettings((current) => ({ ...current, intervalDays: event.target.value }))} />
+          days
+        </label>
+        <label className="follow-up-enabled"><input type="checkbox" checked={followUpSettings.enabled} onChange={(event) => setFollowUpSettings((current) => ({ ...current, enabled: event.target.checked }))} /> Enable reminders</label>
+        <button type="submit" className="secondary">Save reminder settings</button>
+      </form>
+      {reminders.length ? <div className="application-reminder-list">{reminders.map((reminder) => {
+        const overdue = new Date(reminder.dueAt) < new Date();
+        return <article className="application-reminder-row" key={reminder.id}>
+          <div><strong>{overdue ? "Overdue follow-up" : "Upcoming follow-up"}</strong><span>Due {new Date(reminder.dueAt).toLocaleString("en-IN", { dateStyle: "medium", timeStyle: "short" })}</span></div>
+          <input type="datetime-local" value={rescheduleValue} onChange={(event) => setRescheduleValue(event.target.value)} aria-label="New reminder date" />
+          <button type="button" className="secondary" disabled={!rescheduleValue} onClick={() => { const dueAt = new Date(rescheduleValue).toISOString(); updateReminder(reminder.id, { due_at: dueAt }); setRescheduleValue(""); }}>Reschedule</button>
+          <button type="button" className="secondary" onClick={() => updateReminder(reminder.id, { complete: true })}>Complete</button>
+        </article>;
+      })}</div> : <div className="empty"><strong>No pending follow-up reminders.</strong><span>Terminal statuses such as offers, rejections and withdrawals are excluded.</span></div>}
     </section>
 
     <section className="panel application-interview-rounds-card">
@@ -2654,8 +2799,6 @@ function RecruiterMessagesPage({ user }) {
     return () => window.clearInterval(timer);
   }, [connected]);
 
-  const newMessages = messages.filter((item) => item.id && !viewedMessageIds.includes(item.id));
-  const interviewMessages = messages.filter((item) => classifyEmail(item) === "Interview").length;
   const submittedStatuses = new Set([
     "applied",
     "application received",
@@ -2677,17 +2820,15 @@ function RecruiterMessagesPage({ user }) {
   const appliedJobsCount = applicationStatuses.filter((status) =>
     submittedStatuses.has(status)
   ).length;
-  const awaitingResponseCount = applicationStatuses.filter((status) =>
-    ["applied", "application received", "under review"].includes(status)
-  ).length;
   const interviewStageCount = applicationStatuses.filter((status) =>
     ["interview scheduled", "interview"].includes(status)
   ).length;
   const offersReceivedCount = applicationStatuses.filter((status) =>
-    ["selected", "offer received", "offer"].includes(status)
+    ["offer received", "offer"].includes(status)
   ).length;
+  const rejectedCount = applicationStatuses.filter((status) => status === "rejected").length;
+  const selectedCount = applicationStatuses.filter((status) => status === "selected").length;
   const updatedMessageRecords = messages.filter((message) => message.statusUpdated);
-  const statusUpdateCount = updatedMessageRecords.length;
   const applicationFilterStatuses = {
     appliedJobs: new Set([
       "applied",
@@ -2703,9 +2844,10 @@ function RecruiterMessagesPage({ user }) {
       "offer",
       "rejected",
     ]),
-    awaitingResponse: new Set(["applied", "application received", "in review", "under review"]),
     interviewStage: new Set(["interview scheduled", "interview"]),
-    offersReceived: new Set(["selected", "offer received", "offer"]),
+    offersReceived: new Set(["offer received", "offer"]),
+    rejected: new Set(["rejected"]),
+    selected: new Set(["selected"]),
   };
   const filteredApplications = applicationFilter
     ? applications.filter((application) =>
@@ -2756,28 +2898,22 @@ function RecruiterMessagesPage({ user }) {
           <p className="muted-text">Gmail messages are matched to your tracked applications and strong status signals can update them automatically.</p>
           {connected && <small className="recruiter-connected-badge">● Gmail connected{connectedEmail ? ` · ${connectedEmail}` : ""}</small>}
         </div>
-        <div className="recruiter-header-actions">
-          {connected ? (
+        {connected && (
+          <div className="recruiter-header-actions">
             <button type="button" className="action-blue-button recruiter-sync-button" onClick={syncMessages} disabled={syncing}>
               {syncing ? "Syncing…" : "↻ Check for updates"}
             </button>
-          ) : (
-            <button type="button" className="action-blue-button recruiter-sync-button" onClick={connectGmail} disabled={connecting}>
-              {connecting ? "Connecting…" : "Connect Gmail"}
-            </button>
-          )}
-        </div>
+          </div>
+        )}
       </div>
 
       <div className="recruiter-message-summary" aria-label="Application and message summary">
-        <button type="button" className={`recruiter-summary-tile ${messageFilter === "all" ? "active" : ""}`} aria-pressed={messageFilter === "all"} onClick={() => openMessageFilter("all")}><strong>{messages.length}</strong><span>Total messages</span></button>
-        <button type="button" className={`recruiter-summary-tile ${messageFilter === "new" ? "active" : ""}`} aria-pressed={messageFilter === "new"} onClick={() => openMessageFilter("new")}><strong>{newMessages.length}</strong><span>New</span></button>
-        <button type="button" className={`recruiter-summary-tile ${messageFilter === "interviews" ? "active" : ""}`} aria-pressed={messageFilter === "interviews"} onClick={() => openMessageFilter("interviews")}><strong>{interviewMessages}</strong><span>Interview signals</span></button>
-        <button type="button" className={`recruiter-summary-tile ${messageFilter === "updated" ? "active" : ""}`} aria-pressed={messageFilter === "updated"} onClick={() => openMessageFilter("updated")}><strong>{statusUpdateCount}</strong><span>Applications updated</span></button>
         <button type="button" className={`recruiter-summary-tile recruiter-summary-stat ${applicationFilter === "appliedJobs" ? "active" : ""}`} aria-pressed={applicationFilter === "appliedJobs"} title="Applications with a submitted or later status" onClick={() => openApplicationFilter("appliedJobs")}><strong>{appliedJobsCount}</strong><span>Applied jobs</span></button>
-        <button type="button" className={`recruiter-summary-tile recruiter-summary-stat ${applicationFilter === "awaitingResponse" ? "active" : ""}`} aria-pressed={applicationFilter === "awaitingResponse"} title="Applied, application received, or under review" onClick={() => openApplicationFilter("awaitingResponse")}><strong>{awaitingResponseCount}</strong><span>Awaiting response</span></button>
-        <button type="button" className={`recruiter-summary-tile recruiter-summary-stat ${applicationFilter === "interviewStage" ? "active" : ""}`} aria-pressed={applicationFilter === "interviewStage"} title="Interview scheduled or interview status" onClick={() => openApplicationFilter("interviewStage")}><strong>{interviewStageCount}</strong><span>Interview stage</span></button>
-        <button type="button" className={`recruiter-summary-tile recruiter-summary-stat ${applicationFilter === "offersReceived" ? "active" : ""}`} aria-pressed={applicationFilter === "offersReceived"} title="Selected, offer received, or offer status" onClick={() => openApplicationFilter("offersReceived")}><strong>{offersReceivedCount}</strong><span>Offers received</span></button>
+        <button type="button" className={`recruiter-summary-tile ${messageFilter === "all" ? "active" : ""}`} aria-pressed={messageFilter === "all"} onClick={() => openMessageFilter("all")}><strong>{messages.length}</strong><span>Total messages</span></button>
+        <button type="button" className={`recruiter-summary-tile recruiter-summary-stat ${applicationFilter === "offersReceived" ? "active" : ""}`} aria-pressed={applicationFilter === "offersReceived"} title="Applications with an offer status" onClick={() => openApplicationFilter("offersReceived")}><strong>{offersReceivedCount}</strong><span>Offers</span></button>
+        <button type="button" className={`recruiter-summary-tile recruiter-summary-stat ${applicationFilter === "rejected" ? "active" : ""}`} aria-pressed={applicationFilter === "rejected"} title="Rejected applications" onClick={() => openApplicationFilter("rejected")}><strong>{rejectedCount}</strong><span>Rejected</span></button>
+        <button type="button" className={`recruiter-summary-tile recruiter-summary-stat ${applicationFilter === "interviewStage" ? "active" : ""}`} aria-pressed={applicationFilter === "interviewStage"} title="Interview scheduled or interview status" onClick={() => openApplicationFilter("interviewStage")}><strong>{interviewStageCount}</strong><span>Interview</span></button>
+        <button type="button" className={`recruiter-summary-tile recruiter-summary-stat ${applicationFilter === "selected" ? "active" : ""}`} aria-pressed={applicationFilter === "selected"} title="Selected applications" onClick={() => openApplicationFilter("selected")}><strong>{selectedCount}</strong><span>Selected</span></button>
       </div>
 
       {lastSync && <div className="recruiter-sync-meta">Last checked {lastSync.toLocaleTimeString("en-IN", { hour: "2-digit", minute: "2-digit" })} · checks every 5 minutes while this page is open</div>}
@@ -2797,9 +2933,10 @@ function RecruiterMessagesPage({ user }) {
           <div className="recruiter-application-results-heading">
             <strong>
               {applicationFilter === "appliedJobs" && "Applied jobs"}
-              {applicationFilter === "awaitingResponse" && "Applications awaiting response"}
-              {applicationFilter === "interviewStage" && "Interview-stage applications"}
-              {applicationFilter === "offersReceived" && "Offers received"}
+              {applicationFilter === "interviewStage" && "Interview applications"}
+              {applicationFilter === "offersReceived" && "Offer applications"}
+              {applicationFilter === "rejected" && "Rejected applications"}
+              {applicationFilter === "selected" && "Selected applications"}
             </strong>
             <span>{filteredApplications.length} application{filteredApplications.length === 1 ? "" : "s"}</span>
           </div>

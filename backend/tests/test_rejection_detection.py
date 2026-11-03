@@ -11,7 +11,13 @@ from sqlalchemy.orm import Session, sessionmaker
 from sqlalchemy.pool import StaticPool
 
 from app.database import Base
-from app.models import GoogleMailbox, JobApplication, RecruiterMessage, User
+from app.models import (
+    ApplicationStatusHistory,
+    GoogleMailbox,
+    JobApplication,
+    RecruiterMessage,
+    User,
+)
 from app.routers.recruiter_messages import (
     ManualMatchRequest,
     _classify_application_outcome,
@@ -25,6 +31,7 @@ from app.routers.recruiter_messages import (
     _sync_messages_for_user,
     review_message_match,
 )
+from app.routers.jobs import JobUpdate, application_timeline, update_job
 from app.routers import recruiter_messages as recruiter_messages_router
 
 
@@ -130,6 +137,27 @@ def _smiths_gmail_message(message_id: str = "smiths-gmail-message") -> dict:
     }
 
 
+def _gmail_message(
+    sender: str,
+    subject: str,
+    body: str,
+    message_id: str = "company-extraction-message",
+) -> dict:
+    return {
+        "id": message_id,
+        "payload": {
+            "mimeType": "text/plain",
+            "headers": [
+                {"name": "From", "value": sender},
+                {"name": "Subject", "value": subject},
+            ],
+            "body": {
+                "data": base64.urlsafe_b64encode(body.encode()).decode(),
+            },
+        },
+    }
+
+
 def test_rejection_phrases_are_detected():
     assert _classify_application_outcome(
         "Update on your application", "Unfortunately, we will not be moving forward with your application."
@@ -208,6 +236,81 @@ def test_company_and_role_match_from_email_when_sender_is_third_party():
     assert _match_application(email, [app]) is app
 
 
+@pytest.mark.parametrize(
+    "sender",
+    [
+        "notifications@smartrecruiters.com",
+        "notifications@myworkdayjobs.com",
+        "notifications@greenhouse.io",
+        "notifications@hire.lever.co",
+    ],
+)
+def test_ats_sender_does_not_replace_explicit_employer(sender):
+    parsed = _parse_message(
+        _gmail_message(
+            sender,
+            "Software Engineer application at Acme Robotics",
+            "We have decided to move forward with another candidate.",
+        )
+    )
+
+    assert parsed["company"] == "Acme Robotics"
+
+
+def test_company_name_in_body_is_extracted():
+    parsed = _parse_message(
+        _gmail_message(
+            "notifications@smartrecruiters.com",
+            "Application update",
+            "Your application for Software Engineer at Acme Robotics is under review.",
+        )
+    )
+
+    assert parsed["company"] == "Acme Robotics"
+
+
+def test_company_name_in_subject_is_extracted():
+    parsed = _parse_message(
+        _gmail_message(
+            "notifications@workday.com",
+            "Update on Software Engineer application at Northstar Labs",
+            "We have decided to move forward with another candidate.",
+        )
+    )
+
+    assert parsed["company"] == "Northstar Labs"
+
+
+def test_company_is_resolved_from_matching_application_reference():
+    application = SimpleNamespace(
+        company="Smiths Detection",
+        role="Software Engineer",
+        external_application_id="REQ-88421",
+    )
+    parsed = _parse_message(
+        _gmail_message(
+            "notifications@greenhouse.io",
+            "Application update",
+            "Requisition ID: REQ-88421. We have selected another candidate.",
+        ),
+        [application],
+    )
+
+    assert parsed["company"] == "Smiths Detection"
+
+
+def test_unidentified_company_from_ats_sender_is_not_reported_as_ats():
+    parsed = _parse_message(
+        _gmail_message(
+            "notifications@smartrecruiters.com",
+            "Application update",
+            "We have decided to move forward with another candidate.",
+        )
+    )
+
+    assert parsed["company"] == "Company"
+
+
 def test_same_company_applications_are_disambiguated_by_role():
     software = SimpleNamespace(
         id=1, company="Smiths Detection", role="Software Engineer",
@@ -281,6 +384,43 @@ def test_email_update_persists_rejection_and_message_in_database(db_session):
     assert stored[0]["detectedStatus"] == "Rejected"
     assert stored[0]["statusUpdated"] is True
     assert stored[0]["message"] == _smiths_email("smiths-db-update")["message"]
+    history = (
+        db_session.query(ApplicationStatusHistory)
+        .filter(ApplicationStatusHistory.job_id == application.id)
+        .one()
+    )
+    assert history.previous_status == "Applied"
+    assert history.new_status == "Rejected"
+    assert history.source == "gmail"
+    assert history.source_email_id == "smiths-db-update"
+    assert "Rejected" in history.reason
+
+
+def test_smiths_detection_gmail_rejection_updates_and_persists_message(db_session):
+    user = _create_user(db_session)
+    application = _create_application(db_session, user.id)
+    application.applied_date = date.today() - timedelta(days=5)
+    parsed_email = _parse_message(
+        _gmail_message(
+            "notifications@smartrecruiters.com",
+            "Software Engineer application at Smiths Detection",
+            "We have decided to move forward with another candidate for this particular role.",
+            "smiths-gmail-acceptance",
+        )
+    )
+
+    _process_gmail_messages(db_session, user.id, [parsed_email])
+
+    db_session.refresh(application)
+    stored = _list_gmail_messages(db_session, user.id)
+    assert parsed_email["company"] == "Smiths Detection"
+    assert application.status == "Rejected"
+    assert stored[0]["matchedCompany"] == "Smiths Detection"
+    assert stored[0]["matchedRole"] == "Software Engineer"
+    assert stored[0]["detectedStatus"] == "Rejected"
+    assert stored[0]["message"] == (
+        "We have decided to move forward with another candidate for this particular role."
+    )
 
 
 def test_ambiguous_email_is_persisted_for_review_without_status_change(db_session):
@@ -327,6 +467,84 @@ def test_manual_review_matches_email_and_updates_owned_application(db_session):
     assert reviewed["applicationId"] == application.id
     assert reviewed["matchingReviewStatus"] == "matched"
     assert reviewed["statusUpdated"] is True
+    history = (
+        db_session.query(ApplicationStatusHistory)
+        .filter(ApplicationStatusHistory.job_id == application.id)
+        .one()
+    )
+    assert history.source == "gmail_review"
+    assert history.source_email_id == "manual-review-message"
+
+
+def test_manual_status_update_is_recorded_and_timeline_returns_owned_email(db_session):
+    user = _create_user(db_session)
+    application = _create_application(db_session, user.id)
+    application.applied_date = date(2026, 10, 10)
+    db_session.commit()
+    _process_gmail_messages(
+        db_session,
+        user.id,
+        [_smiths_email("timeline-rejection")],
+    )
+    update_job(
+        application.id,
+        JobUpdate(status="In Review", status_reason="Recruiter confirmed review."),
+        db_session,
+        user,
+    )
+
+    timeline = application_timeline(application.id, db_session, user)
+    assert timeline["currentStatus"] == "In Review"
+    assert [item["status"] for item in timeline["history"]] == [
+        "Rejected",
+        "In Review",
+    ]
+    assert timeline["history"][0]["sourceEmailId"] == "timeline-rejection"
+    assert timeline["history"][1]["source"] == "manual"
+    assert timeline["history"][1]["reason"] == "Recruiter confirmed review."
+    assert timeline["emails"][0]["id"] == "timeline-rejection"
+    assert timeline["emails"][0]["message"]
+
+
+def test_timeline_uses_existing_matched_email_when_history_is_unavailable(db_session):
+    user = _create_user(db_session, "legacy-timeline@example.com")
+    application = _create_application(db_session, user.id, status="Rejected")
+    email = _smiths_email("legacy-rejection")
+    received_at = datetime.fromisoformat(email["receivedAt"]).replace(tzinfo=None)
+    db_session.add(
+        RecruiterMessage(
+            user_id=user.id,
+            job_id=application.id,
+            company="Smiths Detection",
+            role="Software Engineer",
+            sender_email="notifications@smartrecruiters.com",
+            subject=email["subject"],
+            body=email["message"],
+            category="updated",
+            application_status="Rejected",
+            source="gmail",
+            external_url="gmail:legacy-rejection",
+            received_at=received_at,
+        )
+    )
+    db_session.commit()
+
+    timeline = application_timeline(application.id, db_session, user)
+
+    assert timeline["history"][0]["source"] == "gmail"
+    assert timeline["history"][0]["sourceEmailId"] == "legacy-rejection"
+    assert timeline["history"][0]["timestamp"] == received_at
+
+
+def test_timeline_rejects_applications_owned_by_another_user(db_session):
+    owner = _create_user(db_session, "timeline-owner@example.com")
+    other_user = _create_user(db_session, "timeline-other@example.com")
+    application = _create_application(db_session, owner.id)
+
+    with pytest.raises(Exception) as error:
+        application_timeline(application.id, db_session, other_user)
+
+    assert getattr(error.value, "status_code", None) == 404
 
 
 def test_duplicate_gmail_message_is_not_processed_or_stored_twice(db_session):
