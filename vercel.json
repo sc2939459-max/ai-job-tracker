@@ -35,6 +35,10 @@
     {
       "path": "/api/reminders/cron",
       "schedule": "0 9 * * *"
+    },
+    {
+      "path": "/api/recruiter-messages/cron-sync",
+      "schedule": "*/15 * * * *"
     }
   ]
 }

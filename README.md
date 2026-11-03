@@ -171,9 +171,12 @@ interview rounds and eventually to an offer or other outcome.
 ### 🧭 Application Timeline & Follow-up Reminders
 
 Each application detail page shows its status journey, recorded status
-changes, matched Gmail messages, and linked interview rounds. Manual
-status changes ask for confirmation and can include a reason; the timeline
-does not invent dates for stages without a recorded event.
+changes, matched Gmail messages, and linked interview rounds. When Gmail
+is connected, the Applications views check for recruiter updates
+automatically, and a scheduled Vercel job checks connected mailboxes every
+15 minutes. Manual status correction remains available as an optional
+fallback; the timeline does not invent dates for stages without a recorded
+event.
 
 Follow-up reminders can be enabled or disabled per account and configured
 for an interval of 1–90 days. Pending reminders can be rescheduled or
@@ -201,7 +204,11 @@ Rejection / not moving forward
 ```
 
 The goal is to reduce manual status updates while keeping the
-application record synchronized with recruiter communication.
+application record synchronized with recruiter communication. Automatic
+updates require a connected Gmail mailbox and an email that can be matched
+to a specific application. External job portals do not provide a universal
+status feed, so changes visible only inside a portal cannot be detected.
+Set `CRON_SECRET` in Vercel to authorize scheduled mailbox checks.
 
 > Gmail/OAuth configuration requires environment variables and Google
 > Cloud configuration. Never commit real OAuth secrets or `.env` files

@@ -176,6 +176,21 @@ const apiGetJobs = () =>
     params: cacheBustParams(),
   });
 
+const syncMailboxApplicationStatuses = async () => {
+  const connectionResponse = await api.get("/recruiter-messages/status");
+  if (!connectionResponse.data?.connected) {
+    return { connected: false, messages: [] };
+  }
+
+  const messagesResponse = await api.get("/recruiter-messages");
+  return {
+    connected: true,
+    messages: Array.isArray(messagesResponse.data)
+      ? messagesResponse.data
+      : [],
+  };
+};
+
 const apiGetInterviews = () =>
   api.get("/interviews", {
     params: cacheBustParams(),
@@ -2342,6 +2357,11 @@ function ApplicationProcessPage({ jobId, onNavigate, returnPage = "applications"
   const [interviews, setInterviews] = useState([]);
   const [statusHistory, setStatusHistory] = useState([]);
   const [applicationEmails, setApplicationEmails] = useState([]);
+  const [gmailConnected, setGmailConnected] = useState(false);
+  const [checkingAutomaticStatus, setCheckingAutomaticStatus] = useState(false);
+  const [lastAutomaticStatusCheck, setLastAutomaticStatusCheck] = useState(null);
+  const [automaticStatusError, setAutomaticStatusError] = useState("");
+  const [connectingGmail, setConnectingGmail] = useState(false);
   const [reminders, setReminders] = useState([]);
   const [followUpSettings, setFollowUpSettings] = useState({ intervalDays: 7, enabled: true });
   const [statusDraft, setStatusDraft] = useState("");
@@ -2350,6 +2370,7 @@ function ApplicationProcessPage({ jobId, onNavigate, returnPage = "applications"
   const [actionError, setActionError] = useState("");
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
+  const automaticSyncInProgress = useRef(false);
 
   const loadApplication = async () => {
     if (!jobId) return;
@@ -2377,8 +2398,55 @@ function ApplicationProcessPage({ jobId, onNavigate, returnPage = "applications"
     }
   };
 
+  const checkAutomaticStatus = async () => {
+    if (!jobId || automaticSyncInProgress.current) return;
+    automaticSyncInProgress.current = true;
+    setCheckingAutomaticStatus(true);
+    setAutomaticStatusError("");
+
+    try {
+      const syncResult = await syncMailboxApplicationStatuses();
+      setGmailConnected(syncResult.connected);
+      setLastAutomaticStatusCheck(new Date());
+      if (!syncResult.connected) return;
+
+      const [jobResponse, timelineResponse] = await Promise.all([
+        apiGetJobs(),
+        api.get(`/jobs/${jobId}/timeline`, { params: cacheBustParams() }),
+      ]);
+      const updatedJob = (Array.isArray(jobResponse.data) ? jobResponse.data : [])
+        .find((item) => String(item.id) === String(jobId));
+      if (updatedJob) {
+        setJob(updatedJob);
+        setStatusDraft(updatedJob.status || "Applied");
+      }
+      setStatusHistory(Array.isArray(timelineResponse.data?.history) ? timelineResponse.data.history : []);
+      setApplicationEmails(Array.isArray(timelineResponse.data?.emails) ? timelineResponse.data.emails : []);
+      window.dispatchEvent(new Event("jobtracker:data-changed"));
+    } catch (syncError) {
+      setAutomaticStatusError(
+        syncError.response?.data?.detail || "Unable to check for automatic company updates."
+      );
+    } finally {
+      automaticSyncInProgress.current = false;
+      setCheckingAutomaticStatus(false);
+    }
+  };
+
   useEffect(() => {
     loadApplication();
+    checkAutomaticStatus();
+
+    const timer = window.setInterval(() => {
+      if (document.visibilityState === "visible") checkAutomaticStatus();
+    }, 60_000);
+    const onFocus = () => checkAutomaticStatus();
+    window.addEventListener("focus", onFocus);
+
+    return () => {
+      window.clearInterval(timer);
+      window.removeEventListener("focus", onFocus);
+    };
   }, [jobId]);
 
   const stages = [
@@ -2412,6 +2480,23 @@ function ApplicationProcessPage({ jobId, onNavigate, returnPage = "applications"
       await loadApplication();
     } catch (err) {
       setActionError(err.response?.data?.detail || "Unable to update application status.");
+    }
+  };
+
+  const connectGmail = async () => {
+    setConnectingGmail(true);
+    setAutomaticStatusError("");
+    try {
+      const response = await api.get("/recruiter-messages/connect");
+      if (!response.data?.authorization_url) {
+        throw new Error("Google authorization URL was not returned.");
+      }
+      window.location.href = response.data.authorization_url;
+    } catch (connectError) {
+      setAutomaticStatusError(
+        connectError.response?.data?.detail || connectError.message || "Unable to connect Gmail."
+      );
+      setConnectingGmail(false);
     }
   };
 
@@ -2476,6 +2561,20 @@ function ApplicationProcessPage({ jobId, onNavigate, returnPage = "applications"
         </div>
         <span className="application-process-stage-count">{statusIndex < 0 ? "Status not mapped" : `${status} · ${progress}%`}</span>
       </div>
+      <div className={`automatic-status-card ${gmailConnected ? "connected" : ""}`}>
+        <span className="automatic-status-icon" aria-hidden="true">{gmailConnected ? "↻" : "✉"}</span>
+        <div className="automatic-status-copy">
+          <strong>{gmailConnected ? "Automatic email status checks are on" : "Connect Gmail for automatic status updates"}</strong>
+          <p>{gmailConnected
+            ? "We check for new recruiter emails while you use the tracker. Clear, matched company updates are added to this timeline automatically."
+            : "Connect your mailbox to detect status changes from company emails. Application portals do not provide a shared status feed."}</p>
+          {lastAutomaticStatusCheck && <small>{checkingAutomaticStatus ? "Checking for company updates…" : `Last checked ${lastAutomaticStatusCheck.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}`}</small>}
+          {automaticStatusError && <small className="automatic-status-error">{automaticStatusError}</small>}
+        </div>
+        {gmailConnected
+          ? <button type="button" className="automatic-status-refresh" onClick={checkAutomaticStatus} disabled={checkingAutomaticStatus}>{checkingAutomaticStatus ? "Checking…" : "Check now"}</button>
+          : <button type="button" className="automatic-status-connect" onClick={connectGmail} disabled={connectingGmail}>{connectingGmail ? "Connecting…" : "Connect Gmail"}</button>}
+      </div>
       <div className="application-process-page-timeline">{stages.map((stage, index) => {
         const event = [...statusHistory].reverse().find((item) => stage.statuses.includes(String(item.status || "").toLowerCase()));
         const current = stage.statuses.includes(normalizedStatus);
@@ -2496,17 +2595,20 @@ function ApplicationProcessPage({ jobId, onNavigate, returnPage = "applications"
           </div>
         </div>;
       })}</div>
-      <div className="manual-status-controls">
-        <label>Status
-          <select value={statusDraft} onChange={(event) => setStatusDraft(event.target.value)}>
-            {statuses.filter((item) => item !== "Wishlist" && item !== "Applying").map((item) => <option key={item}>{item}</option>)}
-          </select>
-        </label>
-        <label>Reason (optional)
-          <input value={statusReason} onChange={(event) => setStatusReason(event.target.value)} placeholder="Why are you updating the status?" />
-        </label>
-        <button type="button" className="action-blue-button" disabled={statusDraft === status} onClick={saveStatus}>Update status</button>
-      </div>
+      <details className="manual-status-disclosure">
+        <summary>Correct status manually <span>Optional fallback</span></summary>
+        <div className="manual-status-controls">
+          <label>Status
+            <select value={statusDraft} onChange={(event) => setStatusDraft(event.target.value)}>
+              {statuses.filter((item) => item !== "Wishlist" && item !== "Applying").map((item) => <option key={item}>{item}</option>)}
+            </select>
+          </label>
+          <label>Reason (optional)
+            <input value={statusReason} onChange={(event) => setStatusReason(event.target.value)} placeholder="Why are you correcting the status?" />
+          </label>
+          <button type="button" className="action-blue-button" disabled={statusDraft === status} onClick={saveStatus}>Save correction</button>
+        </div>
+      </details>
       {actionError && <div className="page-error">{actionError}</div>}
       <div className="process-evidence-box"><span className="process-evidence-icon" aria-hidden="true">i</span><div><strong>Verified history only</strong><p>Timestamp and source are shown when recorded. Earlier stages are not assigned invented dates.</p></div></div>
     </section>
@@ -4040,34 +4142,86 @@ function Panel({ title, children, className = "", action }) {
 
 function Applications({ onOpenProcess }) {
   const [jobs, setJobs] = useState([]);
+  const [gmailConnected, setGmailConnected] = useState(false);
+  const [checkingAutomaticStatus, setCheckingAutomaticStatus] = useState(false);
+  const [lastAutomaticStatusCheck, setLastAutomaticStatusCheck] = useState(null);
+  const [automaticStatusError, setAutomaticStatusError] = useState("");
+  const [connectingGmail, setConnectingGmail] = useState(false);
   const [search, setSearch] = useState("");
   const [filter, setFilter] = useState("");
+  const [quickFilter, setQuickFilter] = useState("all");
+  const [viewMode, setViewMode] = useState("board");
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
   const [updatingJobId, setUpdatingJobId] = useState(null);
+  const jobsRef = useRef([]);
+  const automaticSyncInProgress = useRef(false);
 
-  const load = async () => {
-    setLoading(true);
+  const setLoadedJobs = (nextJobs) => {
+    const previousJobs = jobsRef.current;
+    const previousStatuses = new Map(previousJobs.map((job) => [String(job.id), job.status]));
+    const changed = previousJobs.length > 0 && (
+      previousJobs.length !== nextJobs.length ||
+      nextJobs.some((job) => previousStatuses.get(String(job.id)) !== job.status)
+    );
+    jobsRef.current = nextJobs;
+    setJobs(nextJobs);
+    if (changed) window.dispatchEvent(new Event("jobtracker:data-changed"));
+  };
+
+  const load = async ({ quiet = false } = {}) => {
+    if (!quiet) setLoading(true);
     setError("");
 
     try {
-      const r = await api.get("/jobs", {
-        params: {
-          search: search.trim(),
-          status: filter,
-          _t: Date.now(),
-        },
-      });
-
-      setJobs(Array.isArray(r.data) ? r.data : []);
+      const r = await api.get("/jobs", { params: { _t: Date.now() } });
+      setLoadedJobs(Array.isArray(r.data) ? r.data : []);
     } catch (err) {
       setError(
         err.response?.data?.detail ||
           "Unable to load applications."
       );
-      setJobs([]);
+      setLoadedJobs([]);
     } finally {
-      setLoading(false);
+      if (!quiet) setLoading(false);
+    }
+  };
+
+  const checkAutomaticStatus = async () => {
+    if (automaticSyncInProgress.current) return;
+    automaticSyncInProgress.current = true;
+    setCheckingAutomaticStatus(true);
+    setAutomaticStatusError("");
+
+    try {
+      const syncResult = await syncMailboxApplicationStatuses();
+      setGmailConnected(syncResult.connected);
+      setLastAutomaticStatusCheck(new Date());
+      if (syncResult.connected) await load({ quiet: true });
+    } catch (syncError) {
+      setAutomaticStatusError(
+        syncError.response?.data?.detail || "Unable to check for automatic company updates."
+      );
+    } finally {
+      automaticSyncInProgress.current = false;
+      setCheckingAutomaticStatus(false);
+    }
+  };
+
+  const connectGmail = async () => {
+    setConnectingGmail(true);
+    setAutomaticStatusError("");
+    try {
+      const response = await api.get("/recruiter-messages/connect");
+      if (!response.data?.authorization_url) {
+        throw new Error("Google authorization URL was not returned.");
+      }
+      window.location.href = response.data.authorization_url;
+    } catch (connectError) {
+      setAutomaticStatusError(
+        connectError.response?.data?.detail || connectError.message || "Unable to connect Gmail."
+      );
+      setConnectingGmail(false);
     }
   };
 
@@ -4076,21 +4230,18 @@ function Applications({ onOpenProcess }) {
 
     const refreshApplications = async () => {
       if (!active) return;
-
-      try {
-        await load();
-      } catch (error) {
-        console.error(
-          "Applications refresh failed:",
-          error
-        );
-      }
+      await load({ quiet: true });
     };
 
-    const initialTimer = window.setTimeout(
-      refreshApplications,
-      280
-    );
+    const initialTimer = window.setTimeout(() => {
+      load();
+      checkAutomaticStatus();
+    }, 280);
+    const automaticStatusTimer = window.setInterval(() => {
+      if (active && document.visibilityState === "visible") checkAutomaticStatus();
+    }, 60_000);
+    const checkOnFocus = () => checkAutomaticStatus();
+    window.addEventListener("focus", checkOnFocus);
 
     const cleanupSync = createSyncRefresh(
       refreshApplications
@@ -4099,9 +4250,52 @@ function Applications({ onOpenProcess }) {
     return () => {
       active = false;
       window.clearTimeout(initialTimer);
+      window.clearInterval(automaticStatusTimer);
+      window.removeEventListener("focus", checkOnFocus);
       cleanupSync();
     };
-  }, [search, filter]);
+  }, []);
+
+  const normalized = (value) => String(value || "").trim().toLowerCase();
+  const interviewStatuses = ["interview", "interview scheduled"];
+  const offerStatuses = ["offer", "offer received", "selected"];
+  const closedStatuses = ["rejected", "withdrawn"];
+  const activeStatuses = ["wishlist", "applying", "applied", "application received", "in review", "under review", "screening", "shortlisted", "assessment"];
+  const statusOf = (job) => normalized(job.status || "Applied");
+  const matchesQuickFilter = (job) => {
+    const status = statusOf(job);
+    if (quickFilter === "active") return activeStatuses.includes(status);
+    if (quickFilter === "interviews") return interviewStatuses.includes(status);
+    if (quickFilter === "offers") return offerStatuses.includes(status);
+    return true;
+  };
+  const visibleJobs = useMemo(() => {
+    const query = search.trim().toLowerCase();
+    return jobs.filter((job) => {
+      const matchesSearch = !query || [
+        job.company,
+        job.role,
+        job.location,
+        ...(job.required_skills || []),
+      ].some((value) => String(value || "").toLowerCase().includes(query));
+      const matchesStatus = !filter || statusOf(job) === normalized(filter);
+      return matchesSearch && matchesStatus && matchesQuickFilter(job);
+    });
+  }, [jobs, search, filter, quickFilter]);
+
+  const counts = {
+    total: jobs.length,
+    active: jobs.filter((job) => activeStatuses.includes(statusOf(job))).length,
+    interviews: jobs.filter((job) => interviewStatuses.includes(statusOf(job))).length,
+    offers: jobs.filter((job) => offerStatuses.includes(statusOf(job))).length,
+  };
+
+  const boardGroups = [
+    { key: "active", title: "In progress", hint: "Application journey", statuses: activeStatuses },
+    { key: "interviews", title: "Interviews", hint: "Conversations ahead", statuses: interviewStatuses },
+    { key: "offers", title: "Offers", hint: "Good things happen", statuses: offerStatuses },
+    { key: "closed", title: "Closed", hint: "Completed journeys", statuses: closedStatuses },
+  ];
 
   const remove = async (id) => {
     if (!id) return;
@@ -4158,152 +4352,199 @@ function Applications({ onOpenProcess }) {
     })),
   ];
 
-  return (
-    <>
-      <div className="toolbar-card">
-        <div className="filters">
-          <input
-            placeholder="Search company, role or location…"
-            value={search}
-            onChange={(e) => setSearch(e.target.value)}
-          />
-
-          <MenuSelect
-            value={filter}
-            onChange={setFilter}
-            options={statusOptions}
-            placeholder="All statuses"
-          />
-        </div>
+  const renderApplicationCard = (job) => (
+    <article className="application-board-card" key={job.id}>
+      <div className="application-board-card-top">
+        <span className="application-company-avatar" aria-hidden="true">
+          {(job.company || "?").trim().charAt(0).toUpperCase()}
+        </span>
+        <span className={`status status-${String(job.status || "Applied").toLowerCase()}`}>
+          {statusIcons[job.status] || "●"} {job.status || "Applied"}
+        </span>
       </div>
-
-      <section className="panel application-sync-notice">
-        <div>
-          <div className="eyebrow">APPLICATION STATUS</div>
-          <h3>Confirm when you finish applying on an external portal</h3>
-          <p className="muted-text">
-            Portals do not notify JobTracker directly. Applications started
-            from Search Jobs stay as Applying until you confirm submission
-            here; connected Gmail can also detect some recruiter updates.
-          </p>
+      <h3>{job.company || "Company not specified"}</h3>
+      <p className="application-board-role">{job.role || "Role not specified"}</p>
+      <div className="application-board-meta">
+        {job.location && <span>⌖ {job.location}</span>}
+        <span>Applied {job.applied_date || "date not recorded"}</span>
+      </div>
+      {(job.required_skills || []).length > 0 && (
+        <div className="application-board-skills">
+          {job.required_skills.slice(0, 3).map((skill) => <span key={skill}>{skill}</span>)}
+          {job.required_skills.length > 3 && <span>+{job.required_skills.length - 3}</span>}
         </div>
-        <div className="application-sync-badge">
-          <span>●</span> Email + your confirmation
+      )}
+      <div className="application-board-actions">
+        {job.status === "Applying" && (
+          <button
+            type="button"
+            className="application-quick-action"
+            disabled={updatingJobId === job.id}
+            onClick={() => markAsApplied(job)}
+          >
+            {updatingJobId === job.id ? "Updating…" : "✓ Mark applied"}
+          </button>
+        )}
+        <button type="button" className="application-open-action" onClick={() => onOpenProcess?.(job.id)}>
+          View details <span aria-hidden="true">↗</span>
+        </button>
+        <button type="button" className="application-delete-action" onClick={() => remove(job.id)} aria-label={`Delete ${job.company || "application"}`}>
+          ×
+        </button>
+      </div>
+    </article>
+  );
+
+  return (
+    <div className="applications-workspace">
+      <section className="applications-welcome">
+        <div className="applications-welcome-copy">
+          <span className="applications-kicker"><span /> YOUR JOB SEARCH, IN ONE PLACE</span>
+          <h2>Every opportunity has a next step.</h2>
+          <p>Keep your momentum going. Your applications and progress, all in one view.</p>
+        </div>
+        <div className="applications-welcome-art" aria-hidden="true">
+          <div className="orbit orbit-one" />
+          <div className="orbit orbit-two" />
+          <span className="orbit-star">✦</span>
+          <span className="orbit-check">✓</span>
+          <span className="orbit-dot" />
         </div>
       </section>
 
+      <section className={`applications-auto-sync ${gmailConnected ? "connected" : ""}`}>
+        <span className="applications-auto-sync-icon" aria-hidden="true">{gmailConnected ? "↻" : "✉"}</span>
+        <div>
+          <strong>{gmailConnected ? "Company email updates are being checked automatically" : "Connect Gmail to automatically detect company updates"}</strong>
+          <p>{gmailConnected
+            ? "New matched recruiter emails update your application status while this workspace is open."
+            : "Status updates can only be detected from connected company emails; most application portals don’t offer a shared status feed."}</p>
+          {lastAutomaticStatusCheck && <small>{checkingAutomaticStatus ? "Checking now…" : `Last checked ${lastAutomaticStatusCheck.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}`}</small>}
+          {automaticStatusError && <small className="applications-auto-sync-error">{automaticStatusError}</small>}
+        </div>
+        {gmailConnected
+          ? <button type="button" onClick={checkAutomaticStatus} disabled={checkingAutomaticStatus}>{checkingAutomaticStatus ? "Checking…" : "Check now"}</button>
+          : <button type="button" onClick={connectGmail} disabled={connectingGmail}>{connectingGmail ? "Connecting…" : "Connect Gmail"}</button>}
+      </section>
+
+      <section className="application-summary-grid" aria-label="Application summaries">
+        {[
+          { key: "all", label: "All applications", value: counts.total, note: "Across your search", icon: "▤", tone: "blue" },
+          { key: "active", label: "In progress", value: counts.active, note: "Moving forward", icon: "↗", tone: "teal" },
+          { key: "interviews", label: "Interviews", value: counts.interviews, note: "Time to shine", icon: "◷", tone: "violet" },
+          { key: "offers", label: "Offers", value: counts.offers, note: "Your next chapter", icon: "✦", tone: "amber" },
+        ].map((item) => (
+          <button
+            type="button"
+            key={item.key}
+            className={`application-summary-card ${item.tone} ${quickFilter === item.key ? "selected" : ""}`}
+            onClick={() => setQuickFilter(item.key)}
+            aria-pressed={quickFilter === item.key}
+          >
+            <span className="application-summary-icon">{item.icon}</span>
+            <span className="application-summary-label">{item.label}</span>
+            <strong>{item.value}</strong>
+            <span className="application-summary-note">{item.note}<span aria-hidden="true">→</span></span>
+          </button>
+        ))}
+      </section>
+
+      <section className="application-workspace-toolbar" aria-label="Application controls">
+        <div className="application-search-wrap">
+          <span aria-hidden="true">⌕</span>
+          <input
+            aria-label="Search applications"
+            placeholder="Search company, role, location or skill"
+            value={search}
+            onChange={(event) => setSearch(event.target.value)}
+          />
+          {search && <button type="button" onClick={() => setSearch("")} aria-label="Clear search">×</button>}
+        </div>
+        <div className="application-toolbar-actions">
+          <label className="application-status-filter">
+            <span className="sr-only">Filter by application status</span>
+            <MenuSelect value={filter} onChange={setFilter} options={statusOptions} placeholder="All statuses" />
+          </label>
+          <div className="application-view-toggle" role="group" aria-label="Application layout">
+            <button type="button" className={viewMode === "board" ? "active" : ""} onClick={() => setViewMode("board")} aria-pressed={viewMode === "board"}>▦ <span>Board</span></button>
+            <button type="button" className={viewMode === "list" ? "active" : ""} onClick={() => setViewMode("list")} aria-pressed={viewMode === "list"}>☷ <span>List</span></button>
+          </div>
+          <button type="button" className="application-refresh-button" onClick={() => load()} disabled={loading} aria-label="Refresh applications">
+            <span className={loading ? "refreshing" : ""}>↻</span>
+          </button>
+        </div>
+      </section>
+
+      <div className="application-results-heading">
+        <div>
+          <h2>{quickFilter === "all" ? "Your applications" : quickFilter === "active" ? "In progress" : quickFilter === "interviews" ? "Interview stage" : "Offers"}</h2>
+          <span>{loading ? "Updating your workspace…" : `${visibleJobs.length} of ${jobs.length} ${jobs.length === 1 ? "opportunity" : "opportunities"}`}</span>
+        </div>
+        {(search || filter || quickFilter !== "all") && (
+          <button type="button" className="application-clear-filters" onClick={() => { setSearch(""); setFilter(""); setQuickFilter("all"); }}>
+            Clear filters <span aria-hidden="true">×</span>
+          </button>
+        )}
+      </div>
       {error && <div className="page-error">{error}</div>}
 
-      <section className="panel">
-        <table>
-          <thead>
-            <tr>
-              <th>Company</th>
-              <th>Role</th>
-              <th>Status</th>
-              <th>Applied</th>
-              <th>Skills</th>
-              <th>Actions</th>
-            </tr>
-          </thead>
-
-          <tbody>
-            {loading ? (
-              <tr>
-                <td colSpan="6">
-                  <div className="table-loading">
-                    <span className="spinner" />
-                    Loading applications…
-                  </div>
-                </td>
-              </tr>
-            ) : jobs.length ? (
-              jobs.map((j) => (
-                <tr key={j.id}>
-                  <td>
-                    <button
-                      type="button"
-                      className="company-link-button application-company-link"
-                      onClick={() => onOpenProcess?.(j.id)}
-                      title="Open application process"
-                    >
-                      <strong>
-                        {j.company || "Company not specified"}
-                      </strong>
-                    </button>
-                    <small>
-                      {j.location || "Location not set"}
-                    </small>
-                  </td>
-
-                  <td>{j.role || "Role not specified"}</td>
-
-                  <td>
-                    <span
-                      className={`status status-${String(
-                        j.status || "Applied"
-                      ).toLowerCase()}`}
-                    >
-                      {statusIcons[j.status] || "●"}{" "}
-                      {j.status || "Applied"}
-                    </span>
-                    <small className="company-status-note">
-                      Tracked status
-                    </small>
-                  </td>
-
-                  <td>{j.applied_date || "—"}</td>
-
-                  <td>
-                    {(j.required_skills || [])
-                      .slice(0, 4)
-                      .join(", ") || "—"}
-                  </td>
-
-                  <td>
-                    <button
-                      type="button"
-                      className="small"
-                      onClick={() => onOpenProcess?.(j.id)}
-                    >
-                      View
-                    </button>
-                    {j.status === "Applying" && (
-                      <button
-                        type="button"
-                        className="small mark-applied-button"
-                        disabled={updatingJobId === j.id}
-                        onClick={() => markAsApplied(j)}
-                        title="Confirm that you submitted this application on the external portal"
-                      >
-                        {updatingJobId === j.id
-                          ? "Updating…"
-                          : "Mark as Applied"}
-                      </button>
-                    )}
-                    <button
-                      type="button"
-                      className="small danger"
-                      onClick={() => remove(j.id)}
-                    >
-                      Delete
-                    </button>
-                  </td>
-                </tr>
-              ))
-            ) : (
-              <tr>
-                <td colSpan="6">
-                  <div className="empty">
-                    No applications found.
-                  </div>
-                </td>
-              </tr>
-            )}
-          </tbody>
-        </table>
+      {loading ? (
+        <section className="application-loading-state"><span className="spinner" />Loading your applications…</section>
+      ) : visibleJobs.length ? viewMode === "board" ? (
+        <section className="application-board" aria-label="Applications grouped by stage">
+          {boardGroups.map((group) => {
+            const groupJobs = visibleJobs.filter((job) => group.statuses.includes(statusOf(job)));
+            return (
+              <div className={`application-board-column ${group.key}`} key={group.key}>
+                <div className="application-board-column-head">
+                  <div><span className="application-column-indicator" /><h3>{group.title}</h3><span className="application-column-count">{groupJobs.length}</span></div>
+                  <p>{group.hint}</p>
+                </div>
+                <div className="application-board-list">
+                  {groupJobs.length ? groupJobs.map(renderApplicationCard) : <div className="application-board-empty">Nothing here yet</div>}
+                </div>
+              </div>
+            );
+          })}
+        </section>
+      ) : (
+        <section className="application-list-panel">
+          <div className="application-list-scroll">
+            <table className="application-list-table">
+              <thead><tr><th>Company</th><th>Role</th><th>Status</th><th>Applied</th><th>Skills</th><th>Actions</th></tr></thead>
+              <tbody>
+                {visibleJobs.map((job) => (
+                  <tr key={job.id}>
+                    <td><strong>{job.company || "Company not specified"}</strong><small>{job.location || "Location not set"}</small></td>
+                    <td>{job.role || "Role not specified"}</td>
+                    <td><span className={`status status-${String(job.status || "Applied").toLowerCase()}`}>{statusIcons[job.status] || "●"} {job.status || "Applied"}</span></td>
+                    <td>{job.applied_date || "—"}</td>
+                    <td>{(job.required_skills || []).slice(0, 3).join(", ") || "—"}</td>
+                    <td className="application-list-actions">
+                      {job.status === "Applying" && <button type="button" className="small mark-applied-button" disabled={updatingJobId === job.id} onClick={() => markAsApplied(job)}>{updatingJobId === job.id ? "Updating…" : "Mark applied"}</button>}
+                      <button type="button" className="small" onClick={() => onOpenProcess?.(job.id)}>View</button>
+                      <button type="button" className="small danger" onClick={() => remove(job.id)}>Delete</button>
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        </section>
+      ) : (
+        <section className="application-empty-state">
+          <div className="application-empty-icon">⌕</div>
+          <h3>{jobs.length ? "No opportunities match these filters" : "Your next opportunity starts here"}</h3>
+          <p>{jobs.length ? "Try a different search or clear your filters." : "Track roles you’re excited about and keep every next step in view."}</p>
+          {jobs.length > 0 && <button type="button" className="application-empty-reset" onClick={() => { setSearch(""); setFilter(""); setQuickFilter("all"); }}>Clear filters</button>}
+        </section>
+      )}
+      <section className="application-sync-footer">
+        <span className="application-sync-footer-icon">✦</span>
+        <div><strong>Stay in the loop</strong><p>Connect Gmail in Recruiter Messages to spot recruiter replies and application updates.</p></div>
+        <span className="application-sync-footer-badge">EMAIL SYNC</span>
       </section>
-    </>
+    </div>
   );
 }
 
