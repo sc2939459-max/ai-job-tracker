@@ -29,6 +29,7 @@ from app.routers.recruiter_messages import (
     _process_gmail_messages,
     _safe_status_update,
     _sync_messages_for_user,
+    cron_sync_all_mailboxes,
     review_message_match,
 )
 from app.routers.jobs import JobUpdate, application_timeline, update_job
@@ -400,14 +401,14 @@ def test_smiths_detection_gmail_rejection_updates_and_persists_message(db_sessio
     user = _create_user(db_session)
     application = _create_application(db_session, user.id)
     application.applied_date = date.today() - timedelta(days=5)
-    parsed_email = _parse_message(
-        _gmail_message(
-            "notifications@smartrecruiters.com",
-            "Software Engineer application at Smiths Detection",
-            "We have decided to move forward with another candidate for this particular role.",
-            "smiths-gmail-acceptance",
-        )
+    gmail_message = _gmail_message(
+        "notifications@smartrecruiters.com",
+        "Software Engineer application at Smiths Detection",
+        "We have decided to move forward with another candidate for this particular role.",
+        "smiths-gmail-acceptance",
     )
+    gmail_message["internalDate"] = str(int(datetime.now(timezone.utc).timestamp() * 1000))
+    parsed_email = _parse_message(gmail_message)
 
     _process_gmail_messages(db_session, user.id, [parsed_email])
 
@@ -502,8 +503,25 @@ def test_manual_status_update_is_recorded_and_timeline_returns_owned_email(db_se
     assert timeline["history"][0]["sourceEmailId"] == "timeline-rejection"
     assert timeline["history"][1]["source"] == "manual"
     assert timeline["history"][1]["reason"] == "Recruiter confirmed review."
+    assert timeline["history"][1]["updatedBy"] == user.id
     assert timeline["emails"][0]["id"] == "timeline-rejection"
     assert timeline["emails"][0]["message"]
+
+
+def test_manual_status_update_requires_a_reason(db_session):
+    user = _create_user(db_session, "status-reason@example.com")
+    application = _create_application(db_session, user.id)
+
+    with pytest.raises(Exception) as error:
+        update_job(
+            application.id,
+            JobUpdate(status="In Review", status_reason="  "),
+            db_session,
+            user,
+        )
+
+    assert getattr(error.value, "status_code", None) == 400
+    assert "reason is required" in str(getattr(error.value, "detail", ""))
 
 
 def test_timeline_uses_existing_matched_email_when_history_is_unavailable(db_session):
@@ -582,6 +600,34 @@ def test_older_rejection_does_not_replace_advanced_application_state():
     }
     assert not _safe_status_update(app, old_email, "Rejected")
     assert app.status == "Interview"
+
+
+def test_older_email_cannot_overwrite_a_manual_correction():
+    corrected_at = datetime.now(timezone.utc) - timedelta(hours=1)
+    app = SimpleNamespace(
+        status="Applied",
+        applied_date=date.today() - timedelta(days=30),
+        updated_at=corrected_at.replace(tzinfo=None),
+        status_history=[
+            SimpleNamespace(
+                source="manual",
+                created_at=corrected_at.replace(tzinfo=None),
+            )
+        ],
+    )
+    old_email = {
+        "receivedAt": (corrected_at - timedelta(days=1)).isoformat(),
+    }
+
+    assert not _safe_status_update(app, old_email, "Rejected")
+    assert app.status == "Applied"
+
+
+def test_email_without_a_valid_received_date_does_not_update_status():
+    app = SimpleNamespace(status="Applied", applied_date=date.today() - timedelta(days=1))
+
+    assert not _safe_status_update(app, {}, "Rejected")
+    assert app.status == "Applied"
 
 
 def test_message_matching_is_scoped_to_the_current_user(db_session):
@@ -783,3 +829,43 @@ def test_rate_limit_persists_partial_messages_and_cools_down_mailbox(
     )
     with pytest.raises(recruiter_messages_router.GmailRateLimitError):
         _sync_messages_for_user(db_session, user.id, mailbox)
+
+
+def test_scheduled_gmail_sync_authenticates_and_persists_application_updates(
+    db_session, monkeypatch
+):
+    user = _create_user(db_session)
+    application = _create_application(db_session, user.id)
+    application.applied_date = date(2026, 10, 10)
+    mailbox = _create_mailbox(db_session, user.id)
+    mailbox.updated_at = datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(minutes=5)
+    db_session.commit()
+    monkeypatch.setenv("CRON_SECRET", "test-cron-secret")
+    monkeypatch.setattr(
+        recruiter_messages_router,
+        "_fetch_messages",
+        lambda *_args, **_kwargs: ([_smiths_email("cron-sync-rejection")], None),
+    )
+
+    with pytest.raises(Exception) as unauthorized:
+        cron_sync_all_mailboxes(SimpleNamespace(headers={"authorization": ""}), db_session)
+    assert getattr(unauthorized.value, "status_code", None) == 401
+
+    request = SimpleNamespace(
+        headers={"authorization": "Bearer test-cron-secret"}
+    )
+    result = cron_sync_all_mailboxes(request, db_session)
+
+    db_session.refresh(application)
+    assert result["mailboxes"] == 1
+    assert result["applications_updated"] == 1
+    assert result["mailboxes_failed"] == 0
+    assert application.status == "Rejected"
+    history = (
+        db_session.query(ApplicationStatusHistory)
+        .filter(ApplicationStatusHistory.job_id == application.id)
+        .one()
+    )
+    assert history.source == "gmail"
+    assert history.source_email_id == "cron-sync-rejection"
+    assert _list_gmail_messages(db_session, user.id)[0]["statusUpdated"] is True

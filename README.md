@@ -173,8 +173,8 @@ interview rounds and eventually to an offer or other outcome.
 Each application detail page shows its status journey, recorded status
 changes, matched Gmail messages, and linked interview rounds. When Gmail
 is connected, the Applications views check for recruiter updates
-automatically, and a scheduled Vercel job checks connected mailboxes every
-15 minutes. Manual status correction remains available as an optional
+automatically, and a scheduled Vercel job checks connected mailboxes once
+per day on Hobby. Manual status correction remains available as an optional
 fallback; the timeline does not invent dates for stages without a recorded
 event.
 

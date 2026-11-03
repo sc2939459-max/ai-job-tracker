@@ -39,7 +39,7 @@ Clear detected outcomes update the matching user's application: Applied, In Revi
 
 The Applications list and application detail page check for new mail automatically while open, with a short server-side cooldown. Manual sync remains available from Recruiter Messages or through `POST /api/recruiter-messages/sync`.
 
-Vercel also runs `GET /api/recruiter-messages/cron-sync` every 15 minutes. Set a strong `CRON_SECRET` in the Vercel project environment so scheduled requests are authorized; keep that secret private. This background schedule continues checking connected mailboxes when the user is not in the app.
+Vercel runs `GET /api/recruiter-messages/cron-sync` once daily at 10:00 UTC, which is compatible with the Hobby plan's daily cron limit. Set a strong `CRON_SECRET` in the Vercel project environment so scheduled requests are authorized; keep that secret private. This background schedule continues checking connected mailboxes when the user is not in the app. Use **Check for updates** in Recruiter Messages for an immediate manual sync; the scheduled frequency does not limit manual synchronization.
 
 ## 4. Important limitation
 
