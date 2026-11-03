@@ -21,6 +21,7 @@ from .routers import (
     recruiter_messages,
     notifications,
     reminders,
+    response_activity,
 )
 
 from .routers.company_sync import router as company_router
@@ -123,6 +124,11 @@ app.include_router(
 
 app.include_router(
     reminders.router,
+    prefix="/api",
+)
+
+app.include_router(
+    response_activity.router,
     prefix="/api",
 )
 

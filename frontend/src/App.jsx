@@ -1818,57 +1818,54 @@ function ProfileAvatar({ user, photo, className = "profile-avatar" }) {
   );
 }
 
-function ProfilePerformance({ user, onNavigate }) {
-  const [jobs, setJobs] = useState([]);
-  const [interviews, setInterviews] = useState([]);
+function ProfilePerformance({ user, onNavigate, onOpenApplication }) {
   const [resumes, setResumes] = useState([]);
-  const [loading, setLoading] = useState(true);
+  const [profileLoading, setProfileLoading] = useState(true);
+  const [profileError, setProfileError] = useState("");
+  const [activity, setActivity] = useState(null);
+  const [activityLoading, setActivityLoading] = useState(true);
+  const [activityError, setActivityError] = useState("");
+  const [filters, setFilters] = useState({
+    date_from: "",
+    date_to: "",
+    company: "",
+    status: "",
+    response_type: "",
+  });
 
   useEffect(() => {
-  Promise.all([
-    api.get("/jobs"),
-    api.get("/interviews"),
-    api.get("/resumes"),
-  ])
-    .then(([j, i, r]) => {
-      const loadedJobs =
-        Array.isArray(j.data)
-          ? j.data
-          : [];
+    api.get("/resumes")
+      .then((resumeResponse) => {
+        setResumes(Array.isArray(resumeResponse.data) ? resumeResponse.data : []);
+      })
+      .catch((error) => {
+        setProfileError(error.response?.data?.detail || "Unable to load profile performance details.");
+      })
+      .finally(() => setProfileLoading(false));
+  }, []);
 
-      const loadedInterviews =
-        Array.isArray(i.data)
-          ? i.data
-          : [];
-
-      const activeInterviews =
-        loadedInterviews.filter((interview) => {
-          const linkedJob =
-            loadedJobs.find(
-              (job) =>
-                String(job?.id) ===
-                String(interview?.job_id)
-            );
-
-          return (
-            linkedJob &&
-            String(linkedJob.status || "")
-              .trim()
-              .toLowerCase() === "interview"
-          );
-        });
-
-      setJobs(loadedJobs);
-      setInterviews(activeInterviews);
-      setResumes(
-        Array.isArray(r.data)
-          ? r.data
-          : []
-      );
-    })
-    .catch(() => {})
-    .finally(() => setLoading(false));
-}, []);
+  useEffect(() => {
+    let active = true;
+    setActivityLoading(true);
+    setActivityError("");
+    const params = Object.fromEntries(
+      Object.entries(filters).filter(([, value]) => value)
+    );
+    api.get("/response-activity", { params })
+      .then((response) => {
+        if (active) setActivity(response.data);
+      })
+      .catch((error) => {
+        if (active) {
+          setActivity(null);
+          setActivityError(error.response?.data?.detail || "Unable to load response analytics.");
+        }
+      })
+      .finally(() => {
+        if (active) setActivityLoading(false);
+      });
+    return () => { active = false; };
+  }, [filters]);
 
   const profile = readStoredProfile(user);
   const photo = profile.photo || "";
@@ -1884,10 +1881,68 @@ function ProfilePerformance({ user, onNavigate }) {
     ["Resume uploaded", resumes.length > 0],
   ];
   const completion = Math.round((completionItems.filter(([, ok]) => ok).length / completionItems.length) * 100);
-  const submitted = jobs.filter((j) => !["Wishlist", "Withdrawn"].includes(j.status)).length;
-  const responded = jobs.filter((j) => !["Wishlist", "Applied", "Withdrawn"].includes(j.status)).length;
-  const shortlisted = jobs.filter((j) => ["Screening", "Interview", "Offer"].includes(j.status)).length;
-  const offers = jobs.filter((j) => j.status === "Offer").length;
+  const metrics = activity?.metrics || {};
+  const chartColors = ["#4c7cf3", "#31a887", "#f0a641", "#8c68d8", "#e36c73", "#47a8c8", "#6f7f95", "#db8b5a", "#789b4a"];
+  const statusChart = {
+    labels: (activity?.statusDistribution || []).map((item) => item.status),
+    datasets: [{
+      data: (activity?.statusDistribution || []).map((item) => item.count),
+      backgroundColor: chartColors,
+      borderWidth: 0,
+    }],
+  };
+  const trendChart = {
+    labels: (activity?.monthlyTrends || []).map((item) => item.month),
+    datasets: [
+      {
+        label: "Applications",
+        data: (activity?.monthlyTrends || []).map((item) => item.applications),
+        borderColor: "#4c7cf3",
+        backgroundColor: "rgba(76,124,243,.12)",
+        tension: 0.35,
+        fill: true,
+      },
+      {
+        label: "Meaningful responses",
+        data: (activity?.monthlyTrends || []).map((item) => item.responses),
+        borderColor: "#31a887",
+        backgroundColor: "rgba(49,168,135,.10)",
+        tension: 0.35,
+        fill: true,
+      },
+    ],
+  };
+  const distributionChart = {
+    labels: (activity?.responseDistribution || []).map((item) => item.type),
+    datasets: [{
+      label: "Response events",
+      data: (activity?.responseDistribution || []).map((item) => item.events),
+      backgroundColor: chartColors,
+      borderRadius: 6,
+    }],
+  };
+  const chartOptions = {
+    responsive: true,
+    maintainAspectRatio: false,
+    plugins: { legend: { position: "bottom" } },
+    scales: {
+      x: { grid: { display: false } },
+      y: { beginAtZero: true, ticks: { precision: 0 } },
+    },
+  };
+  const doughnutOptions = {
+    responsive: true,
+    maintainAspectRatio: false,
+    plugins: { legend: { position: "bottom" } },
+  };
+  const responseBarOptions = {
+    ...chartOptions,
+    indexAxis: "y",
+    scales: {
+      x: { beginAtZero: true, ticks: { precision: 0 } },
+      y: { grid: { display: false } },
+    },
+  };
 
   return (
     <div className="phase1-page">
@@ -1899,11 +1954,24 @@ function ProfilePerformance({ user, onNavigate }) {
         <div className="performance-score"><strong>{completion}%</strong><span>Profile completion</span></div>
       </section>
 
-      <section className="performance-grid">
-        <div className="panel performance-card"><span>Applications</span><strong>{jobs.length}</strong><small>{submitted} submitted</small></div>
-        <div className="panel performance-card"><span>Shortlisted</span><strong>{shortlisted}</strong><small>Screening + interview + offer</small></div>
-        <div className="panel performance-card"><span>Interviews</span><strong>{interviews.length}</strong><small>Scheduled rounds</small></div>
-        <div className="panel performance-card"><span>Offers</span><strong>{offers}</strong><small>{submitted ? Math.round((offers / submitted) * 100) : 0}% of submitted</small></div>
+      {activityError && <section className="panel performance-details"><div className="page-error">{activityError}</div><button className="secondary" type="button" onClick={() => setFilters((current) => ({ ...current }))}>Retry analytics</button></section>}
+
+      <section className="performance-grid response-summary-grid">
+        {[
+          ["Applications submitted", metrics.totalSubmitted, "Unique submitted applications"],
+          ["Awaiting response", metrics.awaitingResponse, "No meaningful employer decision yet"],
+          ["Application received", metrics.applicationReceived, "Acknowledgements; not counted as decisions"],
+          ["Recruiter responses", metrics.recruiterResponses, "Includes positive and negative decisions"],
+          ["Interviews", metrics.interviewInvitations, "Applications with an interview invitation"],
+          ["Offers", metrics.offers, `${metrics.offerConversionRate || 0}% of submitted applications`],
+          ["Rejected", metrics.rejected, `${metrics.rejectionRate || 0}% of submitted applications`],
+          ["Under review", metrics.underReview, "Current application status"],
+          ["Shortlisted", metrics.shortlisted, "Unique applications"],
+          ["Assessments", metrics.assessmentInvitations, "Applications with an assessment invitation"],
+          ["Withdrawn", metrics.withdrawn, "Submitted applications later withdrawn"],
+        ].map(([label, count, detail]) => <div className="panel performance-card response-metric-card" key={label}>
+          <span>{label}</span><strong>{activityLoading ? "—" : count ?? 0}</strong><small>{detail}</small>
+        </div>)}
       </section>
 
       <section className="panel performance-details">
@@ -1913,9 +1981,49 @@ function ProfilePerformance({ user, onNavigate }) {
         </div>
       </section>
 
-      {!loading && (
-        <section className="panel performance-details"><div className="eyebrow">JOB SEARCH ACTIVITY</div><h2>Response activity</h2><p className="muted-text">{responded} of {submitted} submitted applications have moved beyond the Applied stage.</p></section>
-      )}
+      <section className="panel performance-details response-analytics">
+        <div className="section-heading">
+          <div><div className="eyebrow">JOB SEARCH ACTIVITY</div><h2>Response activity</h2><p className="muted-text">Response rate excludes application acknowledgements. Rates use unique submitted applications as the denominator.</p></div>
+          <div className="response-rate-badge"><strong>{activityLoading ? "—" : `${metrics.responseRate || 0}%`}</strong><span>Overall response rate</span></div>
+        </div>
+        <div className="response-conversion-grid">
+          <div><span>Interview conversion</span><strong>{activityLoading ? "—" : `${metrics.interviewConversionRate || 0}%`}</strong><small>Interviewed applications ÷ submitted applications</small></div>
+          <div><span>Offer conversion</span><strong>{activityLoading ? "—" : `${metrics.offerConversionRate || 0}%`}</strong><small>Offer applications ÷ submitted applications</small></div>
+          <div><span>Rejection rate</span><strong>{activityLoading ? "—" : `${metrics.rejectionRate || 0}%`}</strong><small>Rejected applications ÷ submitted applications</small></div>
+        </div>
+        <form className="response-filter-grid" onSubmit={(event) => event.preventDefault()}>
+          <label><span>Applied from</span><input type="date" value={filters.date_from} onChange={(event) => setFilters((current) => ({ ...current, date_from: event.target.value }))} /></label>
+          <label><span>Applied through</span><input type="date" value={filters.date_to} onChange={(event) => setFilters((current) => ({ ...current, date_to: event.target.value }))} /></label>
+          <label><span>Company</span><select value={filters.company} onChange={(event) => setFilters((current) => ({ ...current, company: event.target.value }))}><option value="">All companies</option>{(activity?.filterOptions?.companies || []).map((company) => <option key={company}>{company}</option>)}</select></label>
+          <label><span>Current status</span><select value={filters.status} onChange={(event) => setFilters((current) => ({ ...current, status: event.target.value }))}><option value="">All statuses</option>{(activity?.filterOptions?.statuses || []).map((status) => <option key={status}>{status}</option>)}</select></label>
+          <label><span>Response type</span><select value={filters.response_type} onChange={(event) => setFilters((current) => ({ ...current, response_type: event.target.value }))}><option value="">All response types</option>{(activity?.filterOptions?.responseTypes || []).map((type) => <option key={type}>{type}</option>)}</select></label>
+          <button type="button" className="secondary response-filter-reset" onClick={() => setFilters({ date_from: "", date_to: "", company: "", status: "", response_type: "" })}>Clear filters</button>
+        </form>
+        {activityLoading && <div className="loading">Loading response analytics…</div>}
+        {!activityLoading && !activityError && (
+          <>
+            <div className="response-chart-grid">
+              <article className="response-chart-card"><h3>Applications by status</h3>{statusChart.labels.length ? <div className="response-chart-canvas response-doughnut"><Doughnut data={statusChart} options={doughnutOptions} /> </div> : <div className="response-chart-empty">No application status data for these filters.</div>}</article>
+              <article className="response-chart-card response-trend-card"><h3>Monthly applications and responses</h3>{(activity.monthlyTrends || []).length ? <div className="response-chart-canvas"><Line data={trendChart} options={chartOptions} /></div> : <div className="response-chart-empty">No dated applications or responses for these filters.</div>}</article>
+              <article className="response-chart-card response-distribution-card"><h3>Response distribution <small>Event counts</small></h3>{(activity.responseDistribution || []).some((item) => item.events) ? <div className="response-chart-canvas response-distribution-canvas"><Bar data={distributionChart} options={responseBarOptions} /></div> : <div className="response-chart-empty">No response events for these filters.</div>}</article>
+            </div>
+            <div className="section-heading response-recent-heading"><div><div className="eyebrow">APPLICATION ACTIVITY</div><h2>Recent Company Responses</h2><p className="muted-text">One row per application. Select a row to view its timeline and matched email history.</p></div><span className="muted-text">{activity.recentResponses?.length || 0} applications</span></div>
+            {activity.recentResponses?.length ? <div className="response-recent-list">{activity.recentResponses.map((item) => (
+              <button type="button" className="response-recent-row" key={item.applicationId} onClick={() => onOpenApplication(item.applicationId)}>
+                <span className="response-company-role"><strong>{item.company || "Company not specified"}</strong><small>{item.role || "Role not specified"}</small></span>
+                <span><small>Applied</small><strong>{item.applicationDate || "Not recorded"}</strong></span>
+                <span><small>Latest response</small><strong>{item.latestResponseDate ? new Date(item.latestResponseDate).toLocaleDateString() : "No date recorded"}</strong></span>
+                <span className={`response-status-pill response-status-${String(item.status || "").toLowerCase().replace(/[^a-z0-9]+/g, "-")}`}>{item.status || "Unknown"}</span>
+                <span className="response-latest-type"><small>{item.responseType}</small><strong>{item.emailSubject || (item.responseType === "Awaiting Response" ? "No employer response recorded" : "Status update")}</strong></span>
+                <span className="response-open-arrow" aria-hidden="true">→</span>
+              </button>
+            ))}</div> : <div className="response-chart-empty response-list-empty">{activity.metrics?.totalSubmitted ? "No applications match these filters." : "No submitted applications yet. Add applications to see your response activity."}</div>}
+          </>
+        )}
+      </section>
+
+      {profileError && <div className="page-error">{profileError}</div>}
+      {profileLoading && <div className="loading">Loading profile performance details…</div>}
     </div>
   );
 }
@@ -7612,6 +7720,10 @@ function App() {
               onNavigate={
                 setPage
               }
+              onOpenApplication={(jobId) => {
+                setProcessJobId(String(jobId));
+                setPage("application-process");
+              }}
             />
           </PageShell>
         ) : page ===

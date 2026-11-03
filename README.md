@@ -218,6 +218,14 @@ The application also supports synchronized refresh behavior so job and
 interview information can be refreshed when data changes or when the
 application regains focus.
 
+Profile Performance includes user-scoped response analytics derived from
+submitted applications, matched Gmail messages, and recorded status
+history. Application acknowledgements are tracked separately and do not
+count as meaningful recruiter decisions. Conversion rates use unique
+submitted applications as their denominator; response-distribution charts
+show event counts separately from unique application counts. Filters
+include application date range, company, current status, and response type.
+
 ------------------------------------------------------------------------
 
 ## 🖥️ Screenshots
