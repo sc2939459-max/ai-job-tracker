@@ -17,3 +17,5 @@ backend/uploads/
 
 # OS
 .DS_Store
+.vercel
+.env*
