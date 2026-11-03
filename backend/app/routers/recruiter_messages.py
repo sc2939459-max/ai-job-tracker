@@ -514,15 +514,38 @@ def _safe_status_update(app: JobApplication, item: dict[str, Any], status: str) 
         return False
 
     received_at = _received_datetime(item)
-    applied_date = getattr(app, "applied_date", None)
-    if received_at and applied_date and received_at.date() < applied_date:
+    if received_at is None:
         return False
+
+    applied_date = getattr(app, "applied_date", None)
+    if applied_date and received_at.date() < applied_date:
+        return False
+
+    history = getattr(app, "status_history", None) or ()
+    manual_corrections = [
+        event
+        for event in history
+        if (getattr(event, "source", "") or "").lower() == "manual"
+        and getattr(event, "created_at", None) is not None
+    ]
+    if manual_corrections:
+        latest_correction = max(
+            manual_corrections,
+            key=lambda event: (
+                event.created_at.replace(tzinfo=timezone.utc)
+                if event.created_at.tzinfo is None
+                else event.created_at.astimezone(timezone.utc)
+            ),
+        )
+        corrected_at = latest_correction.created_at
+        corrected_at = corrected_at.replace(tzinfo=timezone.utc) if corrected_at.tzinfo is None else corrected_at.astimezone(timezone.utc)
+        if received_at <= corrected_at:
+            return False
 
     updated_at = getattr(app, "updated_at", None)
     if (
         status == "Rejected"
         and STATUS_RANK.get(current, 0) >= STATUS_RANK["Shortlisted"]
-        and received_at
         and updated_at
     ):
         updated_utc = updated_at.replace(tzinfo=timezone.utc) if updated_at.tzinfo is None else updated_at.astimezone(timezone.utc)
@@ -739,6 +762,14 @@ def _parse_message(
                 parsed_date = parsed_date.replace(tzinfo=timezone.utc)
             received = parsed_date.astimezone(timezone.utc).isoformat()
         except (TypeError, ValueError, OverflowError):
+            received = None
+    if received is None and message.get("internalDate"):
+        try:
+            received = datetime.fromtimestamp(
+                int(message["internalDate"]) / 1000,
+                tz=timezone.utc,
+            ).isoformat()
+        except (TypeError, ValueError, OverflowError, OSError):
             received = None
 
     body = _extract_text(payload) or message.get("snippet", "")

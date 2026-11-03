@@ -1,5 +1,5 @@
 from datetime import date
-from datetime import datetime, time
+import logging
 
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
@@ -21,6 +21,7 @@ router = APIRouter(
     prefix="/jobs",
     tags=["Jobs"],
 )
+logger = logging.getLogger(__name__)
 
 STATUSES = [
     "Wishlist",
@@ -271,6 +272,11 @@ def update_job(
         normalized_status = normalize_status(updates["status"])
         if not normalized_status or normalized_status not in STATUSES:
             raise HTTPException(status_code=400, detail="Invalid status")
+        if normalized_status != previous_status and not (status_reason or "").strip():
+            raise HTTPException(
+                status_code=400,
+                detail="A reason is required when changing application status.",
+            )
         updates["status"] = normalized_status
 
     for field, value in updates.items():
@@ -282,11 +288,18 @@ def update_job(
             job,
             previous_status,
             "manual",
-            status_reason or "Status changed in the application tracker.",
+            (status_reason or "").strip(),
         )
-    db.commit()
     create_status_notification(db, user, job, previous_status)
-    db.commit()
+    try:
+        db.commit()
+    except Exception:
+        db.rollback()
+        logger.exception("Failed to save application update")
+        raise HTTPException(
+            status_code=500,
+            detail="Could not save the application update.",
+        )
     db.refresh(job)
     return job
 
@@ -367,11 +380,7 @@ def application_timeline(
             "timestamp": (
                 status_email.received_at
                 if status_email
-                else (
-                    datetime.combine(job.applied_date, time.min)
-                    if job.applied_date
-                    else job.created_at
-                )
+                else None
             ),
         }]
     else:
@@ -384,6 +393,7 @@ def application_timeline(
                 "sourceEmailId": item.source_email_id,
                 "reason": item.reason,
                 "timestamp": item.created_at,
+                "updatedBy": item.user_id,
             }
             for item in history
         ]

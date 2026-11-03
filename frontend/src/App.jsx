@@ -2465,10 +2465,20 @@ function ApplicationProcessPage({ jobId, onNavigate, returnPage = "applications"
   const statusIndex = stages.findIndex((stage) => stage.statuses.includes(normalizedStatus));
   const isTerminalStatus = ["offer", "offer received", "selected", "rejected", "withdrawn"].includes(normalizedStatus);
   const progress = statusIndex < 0 ? 0 : isTerminalStatus ? 100 : Math.round(((statusIndex + 1) / 6) * 100);
+  const currentStatusEvent = [...statusHistory].reverse().find(
+    (event) => String(event.status || "").toLowerCase() === normalizedStatus
+  );
+  const currentStatusEmail = currentStatusEvent?.sourceEmailId
+    ? applicationEmails.find((email) => String(email.id) === String(currentStatusEvent.sourceEmailId))
+    : null;
 
   const saveStatus = async () => {
     if (!job || statusDraft === status) return;
-    if (!window.confirm(`Change ${job.company} · ${job.role} from ${status} to ${statusDraft}?`)) return;
+    if (!statusReason.trim()) {
+      setActionError("Add a reason before correcting the application status.");
+      return;
+    }
+    if (!window.confirm(`Change ${job.company} · ${job.role} from ${status} to ${statusDraft}?\n\nReason: ${statusReason.trim()}`)) return;
     setActionError("");
     try {
       await api.put(`/jobs/${job.id}`, {
@@ -2550,6 +2560,12 @@ function ApplicationProcessPage({ jobId, onNavigate, returnPage = "applications"
         <span><small>Current stage</small><strong>{status}</strong></span>
         <span><small>Journey progress</small><strong>{progress}%</strong></span>
       </div>
+      <div className="application-status-evidence" aria-label="Current status evidence">
+        <div><small>Status source</small><strong>{currentStatusEvent?.source === "gmail" || currentStatusEvent?.source === "gmail_review" ? "Detected from Gmail" : currentStatusEvent?.source === "manual" ? "Manually corrected" : "Application record"}</strong></div>
+        <div><small>Last updated</small><strong>{currentStatusEvent?.timestamp ? new Date(currentStatusEvent.timestamp).toLocaleString("en-IN", { dateStyle: "medium", timeStyle: "short" }) : "Date not recorded"}</strong></div>
+        <div><small>Evidence</small><strong>{currentStatusEmail ? <a href="#application-email-history">{currentStatusEmail.subject || "Open recruiter email"}</a> : currentStatusEvent?.source === "gmail" ? "Email evidence unavailable" : "No linked email"}</strong></div>
+        <div><small>Match review</small><strong>{currentStatusEmail ? currentStatusEmail.matchingReviewStatus || "matched" : currentStatusEvent?.source === "gmail" ? "Matched" : "Not applicable"}</strong></div>
+      </div>
     </section>
 
     <section className="panel application-process-page-card">
@@ -2603,17 +2619,17 @@ function ApplicationProcessPage({ jobId, onNavigate, returnPage = "applications"
               {statuses.filter((item) => item !== "Wishlist" && item !== "Applying").map((item) => <option key={item}>{item}</option>)}
             </select>
           </label>
-          <label>Reason (optional)
-            <input value={statusReason} onChange={(event) => setStatusReason(event.target.value)} placeholder="Why are you correcting the status?" />
+          <label>Reason (required)
+            <input required value={statusReason} onChange={(event) => setStatusReason(event.target.value)} placeholder="Why are you correcting the status?" />
           </label>
-          <button type="button" className="action-blue-button" disabled={statusDraft === status} onClick={saveStatus}>Save correction</button>
+          <button type="button" className="action-blue-button" disabled={statusDraft === status || !statusReason.trim()} onClick={saveStatus}>Save correction</button>
         </div>
       </details>
       {actionError && <div className="page-error">{actionError}</div>}
       <div className="process-evidence-box"><span className="process-evidence-icon" aria-hidden="true">i</span><div><strong>Verified history only</strong><p>Timestamp and source are shown when recorded. Earlier stages are not assigned invented dates.</p></div></div>
     </section>
 
-    <section className="panel application-process-page-card application-email-history">
+    <section className="panel application-process-page-card application-email-history" id="application-email-history">
       <div className="application-process-section-heading">
         <div><div className="eyebrow">EMAIL HISTORY</div><h2>Recruiter messages</h2><p>Gmail messages matched to this application.</p></div>
         <span className="application-process-stage-count">{applicationEmails.length} email{applicationEmails.length === 1 ? "" : "s"}</span>
@@ -2626,7 +2642,7 @@ function ApplicationProcessPage({ jobId, onNavigate, returnPage = "applications"
           </div>
           <small>{email.sender || "Sender not available"} · {email.receivedAt ? new Date(email.receivedAt).toLocaleString("en-IN", { dateStyle: "medium", timeStyle: "short" }) : "Date not recorded"}</small>
           <p>{email.statusUpdated ? "This email updated the application status." : "This email did not change the application status."}</p>
-          <small>Match: {email.matchingReviewStatus || "matched"} · Confidence not available</small>
+          <small>Match review: {email.matchingReviewStatus || "matched"}{email.matchingConfidence ? ` · ${email.matchingConfidence} confidence` : ""}</small>
           <details><summary>Open original email</summary><pre>{email.message || "Email content is unavailable."}</pre></details>
         </article>
       ))}</div> : <div className="empty"><strong>No matched emails yet.</strong><span>Unmatched messages remain available for review in Recruiter Messages.</span></div>}
@@ -3268,17 +3284,17 @@ function RecruiterMessagesPage({ user }) {
 }
 function PageShell({ title, user, children }) {
   return (
-    <>
-      <header>
+    <div className="workspace-page">
+      <header className="workspace-page-header">
         <div>
           <div className="eyebrow">JOB SEARCH WORKSPACE</div>
           <h1>{title}</h1>
           <span>Welcome back, {user.name?.split(" ")[0]}.</span>
         </div>
-        <div className="header-pill">● Data synced</div>
+        <div className="header-pill"><span aria-hidden="true">●</span> Live workspace</div>
       </header>
-      {children}
-    </>
+      <div className="workspace-page-content">{children}</div>
+    </div>
   );
 }
 
@@ -4325,7 +4341,10 @@ function Applications({ onOpenProcess }) {
     setUpdatingJobId(job.id);
     setError("");
     try {
-      await api.put(`/jobs/${job.id}`, { status: "Applied" });
+      await api.put(`/jobs/${job.id}`, {
+        status: "Applied",
+        status_reason: "Applicant confirmed the application was submitted.",
+      });
       dispatchJobTrackerSync({
         type: "job-status-updated",
         jobId: job.id,
@@ -5130,7 +5149,12 @@ function JobMarket({ user }) {
       if (existing?.id) {
         // A saved/Wishlist job becomes Applying when the user starts the
         // external application. We never require a second manual action.
-        await api.put(`/jobs/${existing.id}`, { status: isApplyFlow ? "Applying" : status });
+        await api.put(`/jobs/${existing.id}`, {
+          status: isApplyFlow ? "Applying" : status,
+          status_reason: isApplyFlow
+            ? "Applicant started the application from Job Search."
+            : `Applicant updated the tracked job to ${status}.`,
+        });
       } else {
         await api.post("/jobs", payload);
       }
@@ -7389,10 +7413,20 @@ function Resumes() {
 function App() {
   const [user, setUser] = useState(null);
   const [page, setPage] = useState("dashboard");
+  const [mobileNavOpen, setMobileNavOpen] = useState(false);
   const [prepInterviewId, setPrepInterviewId] = useState("");
   const [processJobId, setProcessJobId] = useState("");
   const [accounts, setAccounts] = useState(normalizeAccounts());
   const [profilePhoto, setProfilePhoto] = useState("");
+
+  useEffect(() => {
+    if (!mobileNavOpen) return undefined;
+    const closeOnEscape = (event) => {
+      if (event.key === "Escape") setMobileNavOpen(false);
+    };
+    window.addEventListener("keydown", closeOnEscape);
+    return () => window.removeEventListener("keydown", closeOnEscape);
+  }, [mobileNavOpen]);
 
   useEffect(() => {
     if (!user) return;
@@ -7647,7 +7681,7 @@ function App() {
   ];
 
   return (
-    <div className="app">
+    <div className={`app${mobileNavOpen ? " mobile-nav-open" : ""}`}>
       <aside className="phase4-sidebar">
         <div className="sidebar-brand">
           <span className="brand-mark small">
@@ -7659,6 +7693,18 @@ function App() {
           </strong>
         </div>
 
+        <button
+          type="button"
+          className="mobile-nav-toggle"
+          aria-expanded={mobileNavOpen}
+          aria-controls="workspace-navigation"
+          onClick={() => setMobileNavOpen((open) => !open)}
+        >
+          <span aria-hidden="true">{mobileNavOpen ? "×" : "☰"}</span>
+          {mobileNavOpen ? "Close navigation" : "Open navigation"}
+        </button>
+
+        <div id="workspace-navigation" className="workspace-navigation">
         <div className="nav-label">
           WORKSPACE
         </div>
@@ -7678,9 +7724,11 @@ function App() {
                     ? "active"
                     : ""
                 }
-                onClick={() =>
+                aria-current={page === key ? "page" : undefined}
+                onClick={() => {
                   setPage(key)
-                }
+                  setMobileNavOpen(false)
+                }}
               >
                 <span>
                   {icon}
@@ -7713,9 +7761,11 @@ function App() {
                     ? "active"
                     : ""
                 }
-                onClick={() =>
+                aria-current={page === key ? "page" : undefined}
+                onClick={() => {
                   setPage(key)
-                }
+                  setMobileNavOpen(false)
+                }}
               >
                 <span>
                   {icon}
@@ -7748,9 +7798,11 @@ function App() {
                     ? "active"
                     : ""
                 }
-                onClick={() =>
+                aria-current={page === key ? "page" : undefined}
+                onClick={() => {
                   setPage(key)
-                }
+                  setMobileNavOpen(false)
+                }}
               >
                 <span>
                   {icon}
@@ -7788,6 +7840,7 @@ function App() {
           >
             ↪ &nbsp; Logout
           </button>
+        </div>
         </div>
       </aside>
 
