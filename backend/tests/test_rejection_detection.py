@@ -29,6 +29,7 @@ from app.routers.recruiter_messages import (
     _process_gmail_messages,
     _safe_status_update,
     _sync_messages_for_user,
+    cron_sync_all_mailboxes,
     review_message_match,
 )
 from app.routers.jobs import JobUpdate, application_timeline, update_job
@@ -783,3 +784,43 @@ def test_rate_limit_persists_partial_messages_and_cools_down_mailbox(
     )
     with pytest.raises(recruiter_messages_router.GmailRateLimitError):
         _sync_messages_for_user(db_session, user.id, mailbox)
+
+
+def test_scheduled_gmail_sync_authenticates_and_persists_application_updates(
+    db_session, monkeypatch
+):
+    user = _create_user(db_session)
+    application = _create_application(db_session, user.id)
+    application.applied_date = date(2026, 10, 10)
+    mailbox = _create_mailbox(db_session, user.id)
+    mailbox.updated_at = datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(minutes=5)
+    db_session.commit()
+    monkeypatch.setenv("CRON_SECRET", "test-cron-secret")
+    monkeypatch.setattr(
+        recruiter_messages_router,
+        "_fetch_messages",
+        lambda *_args, **_kwargs: ([_smiths_email("cron-sync-rejection")], None),
+    )
+
+    with pytest.raises(Exception) as unauthorized:
+        cron_sync_all_mailboxes(SimpleNamespace(headers={"authorization": ""}), db_session)
+    assert getattr(unauthorized.value, "status_code", None) == 401
+
+    request = SimpleNamespace(
+        headers={"authorization": "Bearer test-cron-secret"}
+    )
+    result = cron_sync_all_mailboxes(request, db_session)
+
+    db_session.refresh(application)
+    assert result["mailboxes"] == 1
+    assert result["applications_updated"] == 1
+    assert result["mailboxes_failed"] == 0
+    assert application.status == "Rejected"
+    history = (
+        db_session.query(ApplicationStatusHistory)
+        .filter(ApplicationStatusHistory.job_id == application.id)
+        .one()
+    )
+    assert history.source == "gmail"
+    assert history.source_email_id == "cron-sync-rejection"
+    assert _list_gmail_messages(db_session, user.id)[0]["statusUpdated"] is True

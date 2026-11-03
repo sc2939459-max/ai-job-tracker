@@ -2931,6 +2931,7 @@ function RecruiterMessagesPage({ user }) {
     setError("");
     try {
       const response = await api.post("/recruiter-messages/sync");
+      dispatchJobTrackerSync({ type: "gmail-sync-completed" });
       const applicationsResponse = await api.get("/jobs");
       const incoming = Array.isArray(response.data) ? response.data : [];
       const appList = Array.isArray(applicationsResponse.data) ? applicationsResponse.data : [];
@@ -2938,9 +2939,6 @@ function RecruiterMessagesPage({ user }) {
       setApplications(appList);
       refreshReviewState(incoming);
       setLastSync(new Date());
-      if (incoming.some((item) => item.statusUpdated)) {
-        window.dispatchEvent(new Event("jobtracker:data-changed"));
-      }
     } catch (err) {
       setError(err.response?.data?.detail || "Unable to sync recruiter messages.");
       try {
